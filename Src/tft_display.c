@@ -1,0 +1,2113 @@
+/*
+  tft_display.c - status display with touch menu for grblHAL (STM32F4xx, BTT Octopus Pro)
+
+  PROTOTYPE v0.2
+
+  Drives an MKS TS35-R V2.0 (ST7796 480x320, XPT2046 touch) on EXP1/EXP2, wired as in Marlin
+  (MKS_TS35_V2_0 on pins_BTT_OCTOPUS_V1_common.h, EXP cables rotated 180 degrees):
+
+    TFT CS    PE14 (EXP1_07)    TOUCH CS  PE12 (EXP1_05)
+    TFT DC    PE15 (EXP1_08)    TOUCH INT PE13 (EXP1_06)
+    TFT RESET PE10 (EXP1_04)    SPI1 SCK  PA5  (EXP2_02)
+    BACKLIGHT PE9  (EXP1_03)    SPI1 MISO PA6  (EXP2_01)
+                                SPI1 MOSI PA7  (EXP2_06)
+
+  Screens:
+    Main   state, work position (large), machine position or SD job progress, feed rate, WCS.
+           MENU, HOME, UNLOCK, X0 Y0, Z0, HOLD, START.
+           START resumes after HOLD/M0/tool change. When idle it opens the SD card list,
+           or runs the selected file (hold).
+    Menu   X=0, Y=0, Z=0, XYZ=0, PROBE Z, LASER, SD CARD, TOUCH CAL
+    Laser  test pulse with adjustable power and duration
+    Probe  probe Z with the probe input, sets Z0 (plus plate thickness) and retracts
+    SD     file list of the SD card root folder, select and run
+
+  Buttons that move the machine, change offsets or fire the laser must be held for
+  TFT_LONG_PRESS_MS (yellow while held, green when triggered). HOLD acts on touch.
+
+  Drawing is done in small steps from the realtime loop (one glyph, button or screen band
+  per call) so the controller is never blocked for more than a few milliseconds.
+
+  Touch calibration runs on first start (three crosses) and is stored in NVS together with
+  the laser and probe parameters. Recalibrate from the menu (TOUCH CAL) or by holding the
+  status bar on the main screen for 3 seconds while idle.
+
+  Started from my_plugin_init() in joystick_plugin.c.
+*/
+
+#include "driver.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "grbl/hal.h"
+#include "grbl/protocol.h"
+#include "grbl/state_machine.h"
+#include "grbl/system.h"
+#include "grbl/gcode.h"
+#include "grbl/stepper.h"
+#include "grbl/report.h"
+#include "grbl/nvs_buffer.h"
+#include "grbl/spindle_control.h"
+
+#if SDCARD_ENABLE
+#include <strings.h>
+#include "grbl/vfs.h"
+#include "sdcard/sdcard.h"
+#include "sdcard/fs_stream.h"
+#define TFT_SD 1
+#else
+#define TFT_SD 0
+#endif
+
+#include "tft_fonts.h"
+
+#define TFT_VERSION "0.2"
+
+// ------------------------------------------------------------------------
+// Configuration
+// ------------------------------------------------------------------------
+
+#define TFT_WIDTH   480
+#define TFT_HEIGHT  320
+
+// ST7796 memory access control: MV|MX|MY|BGR, same orientation as Marlin with TFT_ROTATION TFT_ROTATE_180.
+// If the picture is upside down use 0x28 (MV|BGR).
+#define TFT_MADCTL  0xE8
+
+#define TFT_SPI_MAX_HZ      22000000    // display write clock (lower it if the picture shows garbage)
+#define TOUCH_SPI_MAX_HZ     2000000    // XPT2046 is specified up to 2.5 MHz
+
+#define TFT_LONG_PRESS_MS        600    // buttons that move the machine or change offsets need a press this long
+#define TFT_CAL_HOLD_MS         3000    // hold the status bar this long to recalibrate touch
+#define TFT_REFRESH_MS           100    // values are read this often
+#define TOUCH_POLL_MS             20
+
+#define PROBE_MAX_DIST         50.0f    // max. probing distance (mm), limited further by the work envelope
+#define PROBE_RETRACT           5.0f    // retract after probing (mm)
+
+// ------------------------------------------------------------------------
+// Pins
+// ------------------------------------------------------------------------
+
+#define TFT_CS_PORT     GPIOE
+#define TFT_CS_PIN      14
+#define TFT_DC_PORT     GPIOE
+#define TFT_DC_PIN      15
+#define TFT_RST_PORT    GPIOE
+#define TFT_RST_PIN     10
+#define TFT_BL_PORT     GPIOE
+#define TFT_BL_PIN      9
+#define TOUCH_CS_PORT   GPIOE
+#define TOUCH_CS_PIN    12
+#define TOUCH_INT_PORT  GPIOE
+#define TOUCH_INT_PIN   13
+
+#define PIN_HI(p) p##_PORT->BSRR = (1u << p##_PIN)
+#define PIN_LO(p) p##_PORT->BSRR = (1u << (p##_PIN + 16))
+#define TOUCH_DOWN() (!(TOUCH_INT_PORT->IDR & (1u << TOUCH_INT_PIN)))
+
+// ------------------------------------------------------------------------
+// Colors (RGB565) and layout
+// ------------------------------------------------------------------------
+
+#define C_BLACK     0x0000
+#define C_WHITE     0xFFFF
+#define C_GREY      0x7BEF
+#define C_DGREY     0x2945
+#define C_RED       0xC800
+#define C_GREEN     0x0560
+#define C_DGREEN    0x0320
+#define C_BLUE      0x02B9
+#define C_ORANGE    0xFC60
+#define C_CYAN      0x07FF
+#define C_YELLOW    0xFFE0
+
+#define BAR_H       40
+#define DRO_Y       46
+#define DRO_ROW_H   56
+#define INFO_Y      218
+#define BTN_Y       244
+#define BTN_H       (TFT_HEIGHT - BTN_Y)
+#define BTN_W       (TFT_WIDTH / 6)
+#define STATE_X     100     // status box on the main screen
+#define STATE_W     160
+
+#define LIST_ROWS   5       // list screens (SD card, settings)
+#define LIST_ROW_Y  46
+#define LIST_ROW_H  40
+#define SD_MAX      40      // max. number of files listed
+#define SET_MAX     200     // max. number of settings listed
+#define GRP_MAX     32      // max. number of setting groups
+
+// ------------------------------------------------------------------------
+// Types
+// ------------------------------------------------------------------------
+
+typedef enum {
+    Scr_Main = 0,
+    Scr_Menu,
+    Scr_Laser,
+    Scr_Probe,
+    Scr_Sd,
+    Scr_SetGroups,
+    Scr_SetList,
+    Scr_SetEdit
+} screen_t;
+
+typedef enum {
+    A_None = 0,
+    A_Menu, A_Back,
+    A_Home, A_Unlock, A_ZeroXY, A_ZeroZ, A_Hold, A_Start,
+    A_ZeroX, A_ZeroY, A_ZeroXYZ, A_ScrProbe, A_ScrLaser, A_ScrSd, A_ScrSettings, A_TouchCal,
+    A_PwrDn, A_PwrUp, A_TimeDn, A_TimeUp, A_Fire,
+    A_PlateDn1, A_PlateDn01, A_PlateUp01, A_PlateUp1, A_FeedDn, A_FeedUp, A_Probe,
+    A_ListUp, A_ListDown, A_SdRun,
+    A_Key0, A_Key1, A_Key2, A_Key3, A_Key4, A_Key5, A_Key6, A_Key7, A_Key8, A_Key9,
+    A_KeyDot, A_KeyMinus, A_KeyDel, A_KeyClr, A_KeyNow, A_Save,
+    A_Mode,
+    A_Row0      // A_Row0 + row
+} action_t;
+
+typedef enum {
+    Fire_OnRelease = 0,
+    Fire_OnPress,
+    Fire_LongPress
+} fire_t;
+
+typedef enum {
+    Style_Normal = 0,
+    Style_Danger,
+    Style_Row
+} style_t;
+
+typedef struct {
+    uint16_t x, y, w, h;
+    const char *label;
+    action_t action;
+    fire_t fire;
+    style_t style;
+    bool enabled;
+    bool pressed;
+    bool fired;
+    bool selected;
+    bool dirty;
+} button_t;
+
+typedef struct {
+    uint16_t x, y;
+    const tft_font_t *font;
+    uint8_t scale;
+    uint8_t len;
+    uint16_t fg, bg;
+    char want[40];
+    char shown[40];
+} field_t;
+
+// Static screen element: text if font is set, otherwise a filled rectangle.
+typedef struct {
+    uint16_t x, y, w, h;
+    const tft_font_t *font;
+    uint8_t scale;
+    const char *text;
+    uint16_t color;
+} static_item_t;
+
+typedef struct {
+    uint32_t magic;
+    uint8_t swap;
+    float ax, bx, ay, by;
+} touch_cal_t;
+
+typedef struct {
+    touch_cal_t cal;
+    uint32_t magic;
+    uint8_t laser_pwr;      // index into laser_pwr_val[]
+    uint8_t laser_time;     // index into laser_time_val[]
+    uint8_t probe_feed;     // index into probe_feed_val[]
+    uint8_t unused;
+    float plate;            // probe plate thickness, mm
+} tft_nvs_t;
+
+#define TOUCH_CAL_MAGIC 0x54435331  // "TCS1"
+#define PARAMS_MAGIC    0x54505231  // "TPR1"
+
+typedef enum {
+    Tft_Off = 0,
+    Tft_Reset,
+    Tft_SwReset,
+    Tft_SleepOut,
+    Tft_Config,
+    Tft_Clear,
+    Tft_CalStart,
+    Tft_Cal,
+    Tft_Static,
+    Tft_Run
+} tft_phase_t;
+
+// ------------------------------------------------------------------------
+// Data
+// ------------------------------------------------------------------------
+
+static const uint8_t laser_pwr_val[] = { 1, 2, 3, 5, 10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 90, 100 };
+static const uint16_t laser_time_val[] = { 10, 20, 50, 100, 200, 500, 1000, 2000 };
+static const uint16_t probe_feed_val[] = { 25, 50, 100, 150, 200, 300 };
+
+#define N_VAL(a) (sizeof(a) / sizeof(a[0]))
+
+#define MAX_BUTTONS 20
+#define MAX_FIELDS  8
+
+enum {
+    F_State = 0, F_Feed, F_Wcs, F_X, F_Y, F_Z, F_Info, F_Mode  // main screen
+};
+enum {
+    F_Pos = 0                                           // menu screen
+};
+enum {
+    F_Val1 = 0, F_Val2, F_Msg                           // laser and probe screens
+};
+enum {
+    F_ListMsg = 0                                       // list screens (SD card, settings)
+};
+enum {
+    F_EdTitle = 0, F_EdName, F_EdNow, F_EdHint, F_EdEntry, F_EdMsg  // setting edit screen
+};
+
+static button_t buttons[MAX_BUTTONS];
+static uint8_t n_buttons = 0;
+static field_t fields[MAX_FIELDS];
+static uint8_t n_fields = 0;
+static const static_item_t *statics = NULL;
+static uint8_t n_statics = 0;
+
+static screen_t screen = Scr_Main, next_screen = Scr_Main;
+static tft_phase_t phase = Tft_Off;
+static uint32_t phase_ms = 0, phase_wait = 0;
+static uint16_t clear_row = 0;
+static uint8_t static_step = 0;
+static uint16_t state_bg = 0xFFFF;
+static bool bar_dirty = false;
+
+static uint32_t br_tft = 0, br_touch = 0;
+
+static nvs_address_t nvs_address = 0;
+static tft_nvs_t nvs;
+static bool params_dirty = false;
+#define cal nvs.cal
+static uint8_t cal_point = 0;
+static int16_t cal_raw[3][2];
+static bool cal_drawn = false;
+
+static bool touch_down = false;
+static uint8_t touch_up_count = 0;
+static uint32_t touch_down_ms = 0, last_touch_poll = 0, last_refresh = 0;
+static int16_t touch_x = -1, touch_y = -1;
+static int8_t touch_btn = -1;
+static bool touch_on_bar = false, touch_sampled = false;
+
+static char msg[40] = "";
+
+// Laser test pulse
+static bool laser_active = false;
+static uint32_t laser_start = 0, laser_dur = 0;
+
+// Probe sequence
+static char seq_cmd[4][32];
+static uint8_t seq_n = 0, seq_i = 0;
+static bool seq_active = false, seq_busy_seen = false, seq_checked = false;
+static uint32_t seq_t0 = 0;
+
+// List screens: rows are buttons 1..LIST_ROWS
+static uint16_t list_count = 0, list_top = 0;
+static int16_t list_sel = -1;
+static char row_text[LIST_ROWS][41];
+
+// SD card
+#if SDCARD_ENABLE
+static char sd_files[SD_MAX][41];
+#endif
+static char sd_path[44] = "";   // selected file, empty if none
+
+// Settings
+typedef struct {
+    const setting_detail_t *setting;
+    uint8_t offset;             // axis index for axis settings
+    uint8_t group;              // index into grp_id[]
+} set_entry_t;
+
+static set_entry_t set_all[SET_MAX];
+static uint16_t set_n = 0;
+static setting_group_t grp_id[GRP_MAX];
+static uint8_t grp_n = 0, grp_cur = 0;
+static uint16_t set_view[SET_MAX];  // indices into set_all[] of the current group
+static uint16_t set_cur = 0;        // index into set_all[] of the setting being edited
+static char edit_buf[16];
+static uint32_t verify_at = 0;      // check the stored value at this time after saving
+
+static on_execute_realtime_ptr on_execute_realtime;
+static on_report_options_ptr on_report_options;
+
+// ------------------------------------------------------------------------
+// SPI1 (register level, polled)
+// ------------------------------------------------------------------------
+
+static uint32_t spi_br_for (uint32_t max_hz)
+{
+    uint32_t pclk = HAL_RCC_GetPCLK2Freq(), br = 0;
+
+    while(br < 7 && (pclk >> (br + 1)) > max_hz)
+        br++;
+
+    return br;
+}
+
+static inline void spi_tx (uint8_t b)
+{
+    while(!(SPI1->SR & SPI_SR_TXE));
+    *(volatile uint8_t *)&SPI1->DR = b;
+}
+
+static void spi_flush (void)
+{
+    while(!(SPI1->SR & SPI_SR_TXE));
+    while(SPI1->SR & SPI_SR_BSY);
+    (void)SPI1->DR;     // clear RXNE/OVR left over from transmit only transfers
+    (void)SPI1->SR;
+}
+
+static uint8_t spi_xfer (uint8_t b)
+{
+    while(!(SPI1->SR & SPI_SR_TXE));
+    *(volatile uint8_t *)&SPI1->DR = b;
+    while(!(SPI1->SR & SPI_SR_RXNE));
+
+    return *(volatile uint8_t *)&SPI1->DR;
+}
+
+static void spi_set_br (uint32_t br)
+{
+    while(SPI1->SR & SPI_SR_BSY);
+    SPI1->CR1 &= ~SPI_CR1_SPE;
+    SPI1->CR1 = SPI_CR1_MSTR | SPI_CR1_SSM | SPI_CR1_SSI | (br << SPI_CR1_BR_Pos); // mode 0, 8 bit, MSB first
+    SPI1->CR1 |= SPI_CR1_SPE;
+}
+
+static void hw_init (void)
+{
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOE_CLK_ENABLE();
+    __HAL_RCC_SPI1_CLK_ENABLE();
+
+    GPIO_InitTypeDef gpio = {
+        .Mode = GPIO_MODE_AF_PP,
+        .Pull = GPIO_NOPULL,
+        .Speed = GPIO_SPEED_FREQ_VERY_HIGH,
+        .Alternate = GPIO_AF5_SPI1,
+        .Pin = GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7
+    };
+    HAL_GPIO_Init(GPIOA, &gpio);
+
+    PIN_HI(TFT_CS);
+    PIN_HI(TOUCH_CS);
+    PIN_HI(TFT_DC);
+    PIN_LO(TFT_BL);
+    PIN_LO(TFT_RST);
+
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio.Alternate = 0;
+    gpio.Pin = (1u << TFT_CS_PIN) | (1u << TFT_DC_PIN) | (1u << TFT_RST_PIN) | (1u << TFT_BL_PIN) | (1u << TOUCH_CS_PIN);
+    HAL_GPIO_Init(GPIOE, &gpio);
+
+    gpio.Mode = GPIO_MODE_INPUT;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    gpio.Pin = 1u << TOUCH_INT_PIN;
+    HAL_GPIO_Init(TOUCH_INT_PORT, &gpio);
+
+    br_tft = spi_br_for(TFT_SPI_MAX_HZ);
+    br_touch = spi_br_for(TOUCH_SPI_MAX_HZ);
+
+    spi_set_br(br_tft);
+}
+
+// ------------------------------------------------------------------------
+// ST7796
+// ------------------------------------------------------------------------
+
+static void tft_cmd (uint8_t cmd)
+{
+    spi_flush();
+    PIN_LO(TFT_DC);
+    spi_tx(cmd);
+    spi_flush();
+    PIN_HI(TFT_DC);
+}
+
+static void tft_begin (void)
+{
+    PIN_LO(TFT_CS);
+}
+
+static void tft_end (void)
+{
+    spi_flush();
+    PIN_HI(TFT_CS);
+}
+
+static void tft_window (uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
+{
+    tft_cmd(0x2A);
+    spi_tx(x0 >> 8);
+    spi_tx(x0 & 0xFF);
+    spi_tx(x1 >> 8);
+    spi_tx(x1 & 0xFF);
+    tft_cmd(0x2B);
+    spi_tx(y0 >> 8);
+    spi_tx(y0 & 0xFF);
+    spi_tx(y1 >> 8);
+    spi_tx(y1 & 0xFF);
+    tft_cmd(0x2C);
+}
+
+static void tft_fill (uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color)
+{
+    if(w == 0 || h == 0)
+        return;
+
+    uint32_t n = (uint32_t)w * h;
+    uint8_t hi = color >> 8, lo = color & 0xFF;
+
+    tft_begin();
+    tft_window(x, y, x + w - 1, y + h - 1);
+    while(n--) {
+        spi_tx(hi);
+        spi_tx(lo);
+    }
+    tft_end();
+}
+
+static const uint8_t *glyph_get (const tft_font_t *font, char c)
+{
+    const char *p = c ? strchr(font->chars, c) : NULL;
+
+    if(p == NULL)
+        p = font->chars; // all fonts start with a space
+
+    return font->data + (uint32_t)(p - font->chars) * font->bytes_per_row * font->height;
+}
+
+static void tft_char (const tft_font_t *font, uint8_t scale, uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t bg)
+{
+    const uint8_t *g = glyph_get(font, c);
+    uint16_t w = font->width * scale, h = font->height * scale;
+
+    tft_begin();
+    tft_window(x, y, x + w - 1, y + h - 1);
+
+    for(uint_fast8_t row = 0; row < font->height; row++) {
+        const uint8_t *bits = g + row * font->bytes_per_row;
+        for(uint_fast8_t sy = 0; sy < scale; sy++) {
+            for(uint_fast8_t col = 0; col < font->width; col++) {
+                uint16_t color = (bits[col >> 3] & (0x80 >> (col & 7))) ? fg : bg;
+                for(uint_fast8_t sx = 0; sx < scale; sx++) {
+                    spi_tx(color >> 8);
+                    spi_tx(color & 0xFF);
+                }
+            }
+        }
+    }
+
+    tft_end();
+}
+
+static void tft_text (const tft_font_t *font, uint8_t scale, uint16_t x, uint16_t y, const char *s, uint16_t fg, uint16_t bg)
+{
+    while(*s) {
+        tft_char(font, scale, x, y, *s++, fg, bg);
+        x += font->width * scale;
+    }
+}
+
+// Init sequence from Marlin st7796s.h: command, number of data bytes, data...
+static const uint8_t st7796_init[] = {
+    0xF0, 1, 0xC3,              // enable command 2 part I
+    0xF0, 1, 0x96,              // enable command 2 part II
+    0x36, 1, TFT_MADCTL,        // memory access control
+    0x3A, 1, 0x55,              // 16 bit color
+    0xB4, 1, 0x01,              // 1-dot inversion
+    0xB6, 3, 0x80, 0x02, 0x3B,  // display function control
+    0xB7, 1, 0xC6,              // entry mode
+    0xC1, 1, 0x15,
+    0xC2, 1, 0xAF,
+    0xC5, 1, 0x22,
+    0xC6, 1, 0x00,
+    0xE8, 8, 0x40, 0x8A, 0x00, 0x00, 0x29, 0x19, 0xA5, 0x33,
+    0xE0, 14, 0xF0, 0x04, 0x08, 0x09, 0x08, 0x15, 0x2F, 0x42, 0x46, 0x28, 0x15, 0x16, 0x29, 0x2D,
+    0xE1, 14, 0xF0, 0x04, 0x09, 0x09, 0x08, 0x15, 0x2E, 0x46, 0x46, 0x28, 0x15, 0x15, 0x29, 0x2D,
+    0x13, 0,                    // normal display mode
+    0x53, 1, 0x24,
+    0xF0, 1, 0x3C,              // disable command 2 part I
+    0xF0, 1, 0x69,              // disable command 2 part II
+    0x29, 0                     // display on
+};
+
+static void tft_config (void)
+{
+    uint_fast16_t i = 0;
+
+    tft_begin();
+    while(i < sizeof(st7796_init)) {
+        uint8_t n = st7796_init[i + 1];
+        tft_cmd(st7796_init[i]);
+        for(uint_fast8_t j = 0; j < n; j++)
+            spi_tx(st7796_init[i + 2 + j]);
+        i += 2 + n;
+    }
+    tft_end();
+}
+
+// ------------------------------------------------------------------------
+// XPT2046 touch
+// ------------------------------------------------------------------------
+
+static uint16_t delta (uint16_t a, uint16_t b)
+{
+    return a > b ? a - b : b - a;
+}
+
+// Same filtering as Marlin: three samples, the two closest are averaged.
+static uint16_t xpt_read (uint8_t cmd)
+{
+    uint16_t d[3];
+
+    for(uint_fast8_t i = 0; i < 3; i++) {
+        spi_xfer(cmd);
+        uint16_t hi = spi_xfer(0), lo = spi_xfer(0);
+        d[i] = ((hi << 8) | lo) >> 3;
+    }
+
+    uint16_t d01 = delta(d[0], d[1]), d02 = delta(d[0], d[2]), d12 = delta(d[1], d[2]);
+
+    if(d01 > d02 || d01 > d12) {
+        if(d02 > d12)
+            d[0] = d[2];
+        else
+            d[1] = d[2];
+    }
+
+    return (d[0] + d[1]) >> 1;
+}
+
+static bool touch_read_raw (int16_t *rx, int16_t *ry)
+{
+    if(!TOUCH_DOWN())
+        return false;
+
+    spi_flush();
+    spi_set_br(br_touch);
+    PIN_LO(TOUCH_CS);
+
+    *rx = (int16_t)xpt_read(0xD0);  // X, 12 bit, differential
+    *ry = (int16_t)xpt_read(0x90);  // Y
+
+    spi_flush();
+    PIN_HI(TOUCH_CS);
+    spi_set_br(br_tft);
+
+    return TOUCH_DOWN() && *rx > 50 && *rx < 4050 && *ry > 50 && *ry < 4050;
+}
+
+static void touch_to_screen (int16_t rx, int16_t ry, int16_t *x, int16_t *y)
+{
+    float u = cal.swap ? ry : rx, v = cal.swap ? rx : ry;
+
+    *x = (int16_t)lroundf(cal.ax * u + cal.bx);
+    *y = (int16_t)lroundf(cal.ay * v + cal.by);
+}
+
+static bool cal_valid (void)
+{
+    return cal.magic == TOUCH_CAL_MAGIC && isfinite(cal.ax) && isfinite(cal.ay) && fabsf(cal.ax) > 0.01f && fabsf(cal.ay) > 0.01f;
+}
+
+static void nvs_save (void)
+{
+    if(nvs_address)
+        hal.nvs.memcpy_to_nvs(nvs_address, (uint8_t *)&nvs, sizeof(tft_nvs_t), true);
+
+    params_dirty = false;
+}
+
+static void nvs_load (void)
+{
+    if(!(nvs_address && hal.nvs.memcpy_from_nvs((uint8_t *)&nvs, nvs_address, sizeof(tft_nvs_t), true) == NVS_TransferResult_OK))
+        memset(&nvs, 0, sizeof(tft_nvs_t));
+
+    if(!cal_valid())
+        cal.magic = 0;
+
+    if(nvs.magic != PARAMS_MAGIC || nvs.laser_pwr >= N_VAL(laser_pwr_val) || nvs.laser_time >= N_VAL(laser_time_val) ||
+        nvs.probe_feed >= N_VAL(probe_feed_val) || !isfinite(nvs.plate) || nvs.plate < 0.0f || nvs.plate > 50.0f) {
+        nvs.magic = PARAMS_MAGIC;
+        nvs.laser_pwr = 4;      // 10 %
+        nvs.laser_time = 3;     // 100 ms
+        nvs.probe_feed = 2;     // 100 mm/min
+        nvs.plate = 0.0f;
+    }
+}
+
+// ------------------------------------------------------------------------
+// Calibration: crosses at three points
+// ------------------------------------------------------------------------
+
+static const int16_t cal_pt[3][2] = { { 40, 40 }, { TFT_WIDTH - 40, 40 }, { 40, TFT_HEIGHT - 40 } };
+
+static void draw_cross (int16_t x, int16_t y, uint16_t color)
+{
+    tft_fill(x - 15, y - 1, 31, 3, color);
+    tft_fill(x - 1, y - 15, 3, 31, color);
+}
+
+static bool cal_compute (void)
+{
+    // Which raw axis changes when moving along the screen x axis?
+    int16_t dxr = cal_raw[1][0] - cal_raw[0][0], dyr = cal_raw[1][1] - cal_raw[0][1];
+
+    cal.swap = abs(dyr) > abs(dxr);
+
+    float u0 = cal.swap ? cal_raw[0][1] : cal_raw[0][0], u1 = cal.swap ? cal_raw[1][1] : cal_raw[1][0];
+    float v0 = cal.swap ? cal_raw[0][0] : cal_raw[0][1], v2 = cal.swap ? cal_raw[2][0] : cal_raw[2][1];
+
+    if(fabsf(u1 - u0) < 300.0f || fabsf(v2 - v0) < 300.0f)
+        return false;
+
+    cal.ax = (float)(cal_pt[1][0] - cal_pt[0][0]) / (u1 - u0);
+    cal.bx = cal_pt[0][0] - cal.ax * u0;
+    cal.ay = (float)(cal_pt[2][1] - cal_pt[0][1]) / (v2 - v0);
+    cal.by = cal_pt[0][1] - cal.ay * v0;
+    cal.magic = TOUCH_CAL_MAGIC;
+
+    return true;
+}
+
+// Returns true when calibration is complete.
+static bool cal_run (uint32_t now)
+{
+    if(!cal_drawn) {
+        tft_fill(0, 0, TFT_WIDTH, TFT_HEIGHT, C_BLACK); // only during calibration, takes ~100 ms
+        tft_text(&font_s, 1, (TFT_WIDTH - 15 * font_s.width) / 2, TFT_HEIGHT / 2 - 30, "Touch the cross", C_WHITE, C_BLACK);
+        tft_text(&font_s, 1, (TFT_WIDTH - 22 * font_s.width) / 2, TFT_HEIGHT / 2, "and release, 3 points", C_GREY, C_BLACK);
+        draw_cross(cal_pt[cal_point][0], cal_pt[cal_point][1], C_YELLOW);
+        cal_drawn = true;
+        touch_sampled = false;
+    }
+
+    if(now - last_touch_poll < TOUCH_POLL_MS)
+        return false;
+    last_touch_poll = now;
+
+    int16_t rx, ry;
+
+    if(touch_read_raw(&rx, &ry)) {
+        if(!touch_down) {
+            touch_down = true;
+            touch_down_ms = now;
+        } else if(!touch_sampled && now - touch_down_ms > 150) {
+            cal_raw[cal_point][0] = rx;
+            cal_raw[cal_point][1] = ry;
+            touch_sampled = true;
+            draw_cross(cal_pt[cal_point][0], cal_pt[cal_point][1], C_GREEN);
+        }
+        touch_up_count = 0;
+    } else if(touch_down && ++touch_up_count >= 3) {
+        touch_down = false;
+        if(touch_sampled) {
+            touch_sampled = false;
+            draw_cross(cal_pt[cal_point][0], cal_pt[cal_point][1], C_BLACK);
+            if(++cal_point < 3)
+                draw_cross(cal_pt[cal_point][0], cal_pt[cal_point][1], C_YELLOW);
+            else {
+                cal_point = 0;
+                cal_drawn = false;
+                if(cal_compute()) {
+                    nvs_save();
+                    return true;
+                }
+                // implausible, start over
+            }
+        }
+    }
+
+    return false;
+}
+
+// ------------------------------------------------------------------------
+// Fields and buttons
+// ------------------------------------------------------------------------
+
+static field_t *field_add (uint16_t x, uint16_t y, const tft_font_t *font, uint8_t scale, uint8_t len, uint16_t fg, uint16_t bg)
+{
+    field_t *f = &fields[n_fields++];
+
+    f->x = x;
+    f->y = y;
+    f->font = font;
+    f->scale = scale;
+    f->len = len;
+    f->fg = fg;
+    f->bg = bg;
+    memset(f->want, ' ', len);
+    f->want[len] = '\0';
+    memset(f->shown, 0, sizeof(f->shown));
+
+    return f;
+}
+
+static void field_set (uint8_t id, const char *s)
+{
+    if(id >= n_fields)
+        return;
+
+    field_t *f = &fields[id];
+    size_t n = strlen(s);
+
+    if(n > f->len)
+        n = f->len;
+
+    memcpy(f->want, s, n);
+    memset(f->want + n, ' ', f->len - n);
+}
+
+static void field_invalidate (uint8_t id)
+{
+    memset(fields[id].shown, 0, sizeof(fields[id].shown));
+}
+
+// Draws one changed glyph, returns false if nothing was left to draw.
+static bool fields_draw_one (void)
+{
+    for(uint_fast8_t id = 0; id < n_fields; id++) {
+        field_t *f = &fields[id];
+        for(uint_fast8_t i = 0; i < f->len; i++) {
+            if(f->want[i] != f->shown[i]) {
+                tft_char(f->font, f->scale, f->x + i * f->font->width * f->scale, f->y, f->want[i], f->fg, f->bg);
+                f->shown[i] = f->want[i];
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static button_t *button_add (uint16_t x, uint16_t y, uint16_t w, uint16_t h, const char *label, action_t action, fire_t fire)
+{
+    button_t *b = &buttons[n_buttons++];
+
+    memset(b, 0, sizeof(button_t));
+    b->x = x;
+    b->y = y;
+    b->w = w;
+    b->h = h;
+    b->label = label;
+    b->action = action;
+    b->fire = fire;
+    b->dirty = true;
+
+    return b;
+}
+
+static void button_set_enabled (button_t *b, bool on)
+{
+    if(b->enabled != on) {
+        b->enabled = on;
+        if(!on)
+            b->pressed = b->fired = false;
+        b->dirty = true;
+    }
+}
+
+static void button_draw (button_t *b)
+{
+    uint16_t x = b->x + 2, y = b->y + 2, w = b->w - 4, h = b->h - 4, bg, fg;
+
+    if(b->style == Style_Row) {
+        bg = b->pressed ? C_DGREY : (b->selected ? C_DGREEN : C_BLACK);
+        fg = C_WHITE;
+    } else if(!b->enabled) {
+        bg = C_DGREY;
+        fg = C_GREY;
+    } else if(b->pressed) {
+        bg = b->fired ? C_GREEN : C_YELLOW;
+        fg = C_BLACK;
+    } else {
+        bg = b->style == Style_Danger ? C_RED : C_BLUE;
+        fg = C_WHITE;
+    }
+
+    tft_fill(x, y, w, h, bg);
+
+    if(b->label && *b->label) {
+        uint16_t tw = strlen(b->label) * font_s.width;
+        uint16_t tx = b->style == Style_Row ? x + 8 : x + (w > tw ? (w - tw) / 2 : 0);
+        tft_text(&font_s, 1, tx, y + (h - font_s.height) / 2, b->label, fg, bg);
+    }
+
+    b->dirty = false;
+}
+
+// ------------------------------------------------------------------------
+// Machine actions
+// ------------------------------------------------------------------------
+
+static bool enqueue (const char *cmd)
+{
+    char buf[48];
+
+    strncpy(buf, cmd, sizeof(buf) - 1); // enqueue_gcode() takes a non-const buffer
+    buf[sizeof(buf) - 1] = '\0';
+
+    return grbl.enqueue_gcode(buf);
+}
+
+static void laser_stop (void)
+{
+    spindle_ptrs_t *sp = spindle_get(0);
+
+    if(sp)
+        sp->set_state(sp, (spindle_state_t){0}, 0.0f);
+
+    laser_active = false;
+}
+
+static void laser_fire (void)
+{
+    spindle_ptrs_t *sp = spindle_get(0);
+
+    if(sp == NULL || spindle_is_on()) {
+        strcpy(msg, "Spindle/laser busy");
+        return;
+    }
+
+    spindle_state_t on = {0};
+    on.on = On;
+
+    laser_dur = laser_time_val[nvs.laser_time];
+    sp->set_state(sp, on, sp->rpm_max * (float)laser_pwr_val[nvs.laser_pwr] / 100.0f);
+    laser_start = hal.get_elapsed_ticks();
+    laser_active = true;
+
+    snprintf(msg, sizeof(msg), "Fired %u ms at %u %%", (unsigned)laser_dur, (unsigned)laser_pwr_val[nvs.laser_pwr]);
+}
+
+static void probe_start (void)
+{
+    float mpos[N_AXIS];
+
+    if(hal.probe.get_state && hal.probe.get_state().triggered) {
+        strcpy(msg, "Probe already triggered!");
+        return;
+    }
+
+    system_convert_array_steps_to_mpos(mpos, sys.position);
+
+    float dist = PROBE_MAX_DIST, room = mpos[Z_AXIS] - sys.work_envelope.min.values[Z_AXIS] - 0.5f;
+
+    if(room < dist)
+        dist = room;
+
+    if(dist < 1.0f) {
+        strcpy(msg, "Too close to Z min");
+        return;
+    }
+
+    snprintf(seq_cmd[0], sizeof(seq_cmd[0]), "G91G38.2Z-%.3fF%u", dist, (unsigned)probe_feed_val[nvs.probe_feed]);
+    strcpy(seq_cmd[1], "G90");
+    snprintf(seq_cmd[2], sizeof(seq_cmd[2]), "G10L20P0Z%.3f", nvs.plate);
+    snprintf(seq_cmd[3], sizeof(seq_cmd[3]), "G91G0Z%.1f", PROBE_RETRACT);
+    seq_n = 4;
+    seq_i = 0;
+    seq_busy_seen = seq_checked = false;
+    seq_active = true;
+
+    strcpy(msg, "Probing...");
+}
+
+// Feeds the probe sequence one command at a time, each one when the previous has finished.
+// enqueue() fails while the previous command has not been picked up yet, which keeps the order.
+static void seq_poll (sys_state_t state, uint32_t now)
+{
+    if(!seq_active)
+        return;
+
+    if(state & (STATE_ALARM|STATE_ESTOP)) {
+        seq_active = false;
+        strcpy(msg, "Probe failed (alarm)");
+        return;
+    }
+
+    // G38.2 has been queued: wait until it has run (state leaves idle and comes back) before checking the result.
+    if(seq_i == 1 && !seq_checked) {
+        if(state != STATE_IDLE) {
+            seq_busy_seen = true;
+            return;
+        }
+        if(!seq_busy_seen) {
+            if(now - seq_t0 < 1000)
+                return;
+            seq_active = false;     // never started, command was rejected
+            enqueue("G90");
+            strcpy(msg, "Probe command rejected");
+            return;
+        }
+        if(!sys.flags.probe_succeeded) {
+            seq_active = false;
+            enqueue("G90");
+            strcpy(msg, "No contact");
+            return;
+        }
+        seq_checked = true;
+    }
+
+    if(state != STATE_IDLE)
+        return;
+
+    if(seq_i == seq_n) {
+        if(enqueue("G90")) {    // restore absolute mode after the retract
+            seq_active = false;
+            strcpy(msg, "Z0 set");
+        }
+        return;
+    }
+
+    if(enqueue(seq_cmd[seq_i])) {
+        if(seq_i == 0)
+            seq_t0 = now;
+        seq_i++;
+    }
+}
+
+#if SDCARD_ENABLE
+
+static bool sd_name_ok (const char *name)
+{
+    static const char *const types[] = { "nc", "ngc", "ncc", "gcode", "gc", "tap", "txt", "cnc", "" };
+    const char *ext = strrchr(name, '.');
+
+    if(ext == NULL || strlen(name) > 40 || strpbrk(name, "?~!"))
+        return false;
+
+    ext++;
+    for(uint_fast8_t i = 0; *types[i]; i++) {
+        if(strlen(ext) == strlen(types[i])) {
+            uint_fast8_t j = 0;
+            while(ext[j] && (ext[j] | 0x20) == types[i][j])
+                j++;
+            if(ext[j] == '\0')
+                return true;
+        }
+    }
+
+    return false;
+}
+
+static bool sd_scan (void)
+{
+    vfs_dir_t *dir;
+    vfs_dirent_t *dirent;
+
+    list_count = list_top = 0;
+    list_sel = -1;
+
+    if((dir = vfs_opendir("/")) == NULL)
+        return false;
+
+    while((dirent = vfs_readdir(dir)) && list_count < SD_MAX) {
+        if(!dirent->st_mode.directory && sd_name_ok(dirent->name)) {
+            // insert sorted
+            uint_fast8_t i = list_count;
+            while(i && strcasecmp(sd_files[i - 1], dirent->name) > 0) {
+                strcpy(sd_files[i], sd_files[i - 1]);
+                i--;
+            }
+            strcpy(sd_files[i], dirent->name);
+            list_count++;
+        }
+    }
+
+    vfs_closedir(dir);
+
+    for(uint_fast8_t i = 0; i < list_count; i++) {
+        if(*sd_path && !strcmp(sd_path + 1, sd_files[i])) {
+            list_sel = i;
+            list_top = i - i % LIST_ROWS;   // show the page with the selected file
+        }
+    }
+
+    return true;
+}
+
+#endif // SDCARD_ENABLE
+
+// ------------------------------------------------------------------------
+// Settings
+// ------------------------------------------------------------------------
+
+static setting_id_t set_id (const set_entry_t *e)
+{
+    return (setting_id_t)(e->setting->id + e->offset);
+}
+
+static void set_name (const set_entry_t *e, char *buf, size_t len)
+{
+    if(e->setting->group == Group_Axis0)
+        snprintf(buf, len, "%s%s", axis_letter[e->offset], e->setting->name);
+    else
+        snprintf(buf, len, "%s", e->setting->name);
+}
+
+static const char *set_value (const set_entry_t *e)
+{
+    char *v = setting_get_value(e->setting, e->offset);
+
+    return v ? v : "N/A";
+}
+
+static bool set_editable (const set_entry_t *e)
+{
+    return e->setting->datatype != Format_String && e->setting->datatype != Format_Password && e->setting->datatype != Format_IPv4;
+}
+
+static void grp_name (uint8_t g, char *buf, size_t len)
+{
+    setting_group_t id = grp_id[g];
+
+    if(id >= Group_Axis0 && id < Group_Axis0 + N_AXIS)
+        snprintf(buf, len, "%s-axis", axis_letter[id - Group_Axis0]);
+    else {
+        const setting_group_detail_t *d = setting_get_group_details(id);
+        snprintf(buf, len, "%s", d && d->name ? d->name : "Other");
+    }
+}
+
+static bool set_collect (const setting_detail_t *setting, uint_fast16_t offset, void *data)
+{
+    if(set_n < SET_MAX) {
+        set_all[set_n].setting = setting;
+        set_all[set_n].offset = (uint8_t)offset;
+        set_n++;
+    }
+
+    return true;
+}
+
+static int set_cmp (const void *a, const void *b)
+{
+    return (int)set_id((const set_entry_t *)a) - (int)set_id((const set_entry_t *)b);
+}
+
+// Collects all available settings (same selection as $$), sorted by number, and their groups.
+static void settings_collect (void)
+{
+    setting_details_t *details = settings_get_details();
+
+    set_n = grp_n = 0;
+
+    do {
+        for(uint_fast16_t i = 0; i < details->n_settings; i++) {
+
+            const setting_detail_t *s = &details->settings[i];
+            bool hidden = (s->id == Setting_HomingFeedRate || s->id == Setting_HomingSeekRate)
+                           ? settings.homing.flags.per_axis_feedrates
+                           : s->flags.hidden;
+
+            if(hidden || s->value == NULL || s->flags.increment)
+                continue;
+
+            if(s->group == Group_Axis0)
+                settings_iterator(s, set_collect, NULL);    // one entry per available axis
+            else if(s->is_available == NULL || s->is_available(s, 0))
+                set_collect(s, 0, NULL);
+        }
+    } while((details = details->next));
+
+    qsort(set_all, set_n, sizeof(set_entry_t), set_cmp);
+
+    for(uint_fast16_t i = 0; i < set_n; i++) {
+
+        const setting_detail_t *s = set_all[i].setting;
+        setting_group_t g = s->group == Group_Axis0 ? (setting_group_t)(Group_Axis0 + set_all[i].offset) : settings_normalize_group(s->group);
+        uint_fast8_t j = 0;
+
+        while(j < grp_n && grp_id[j] != g)
+            j++;
+
+        if(j == grp_n) {
+            if(grp_n < GRP_MAX)
+                grp_id[grp_n++] = g;
+            else
+                j = GRP_MAX - 1;
+        }
+
+        set_all[i].group = j;
+    }
+}
+
+static void settings_view (uint8_t g)
+{
+    list_count = 0;
+
+    for(uint_fast16_t i = 0; i < set_n; i++) {
+        if(set_all[i].group == g)
+            set_view[list_count++] = i;
+    }
+}
+
+// ------------------------------------------------------------------------
+// List screens
+// ------------------------------------------------------------------------
+
+static void row_label (uint16_t i, char *buf)
+{
+    switch(screen) {
+
+#if SDCARD_ENABLE
+        case Scr_Sd:
+            snprintf(buf, 41, "%s", sd_files[i]);
+            break;
+#endif
+
+        case Scr_SetGroups:
+            grp_name(i, buf, 41);
+            break;
+
+        case Scr_SetList:
+            {
+                const set_entry_t *e = &set_all[set_view[i]];
+                char name[40];
+                set_name(e, name, sizeof(name));
+                snprintf(buf, 41, "$%-4u%-22.22s %10.10s", (unsigned)set_id(e), name, set_value(e));
+            }
+            break;
+
+        default:
+            *buf = '\0';
+            break;
+    }
+}
+
+static void list_update_rows (void)
+{
+    for(uint_fast8_t r = 0; r < LIST_ROWS; r++) {
+        button_t *b = &buttons[1 + r];
+        uint16_t i = list_top + r;
+        if(i < list_count)
+            row_label(i, row_text[r]);
+        else
+            *row_text[r] = '\0';
+        b->label = row_text[r];
+        b->selected = (int16_t)i == list_sel;
+        b->enabled = i < list_count;
+        b->dirty = true;
+    }
+
+    if(list_count)
+        snprintf(msg, sizeof(msg), "%u-%u of %u", (unsigned)(list_top + 1), (unsigned)(list_top + LIST_ROWS < list_count ? list_top + LIST_ROWS : list_count), (unsigned)list_count);
+}
+
+static void edit_key (char c)
+{
+    size_t n = strlen(edit_buf);
+    const set_entry_t *e = &set_all[set_cur];
+
+    switch(c) {
+
+        case '<':
+            if(n)
+                edit_buf[n - 1] = '\0';
+            break;
+
+        case 'C':
+            *edit_buf = '\0';
+            break;
+
+        case '-':
+            if(*edit_buf == '-')
+                memmove(edit_buf, edit_buf + 1, n);
+            else if(n < sizeof(edit_buf) - 1) {
+                memmove(edit_buf + 1, edit_buf, n + 1);
+                *edit_buf = '-';
+            }
+            break;
+
+        case '.':
+            if(e->setting->datatype == Format_Decimal && !strchr(edit_buf, '.') && n < sizeof(edit_buf) - 1)
+                strcat(edit_buf, ".");
+            break;
+
+        default:
+            if(n < sizeof(edit_buf) - 1) {
+                edit_buf[n] = c;
+                edit_buf[n + 1] = '\0';
+            }
+            break;
+    }
+}
+
+// ------------------------------------------------------------------------
+// Screens
+// ------------------------------------------------------------------------
+
+static const static_item_t main_statics[] = {
+    { 0, BAR_H, TFT_WIDTH, 2, NULL, 0, NULL, C_DGREY },
+    { 6, DRO_Y, 0, 0, &font_l, 2, "X", C_CYAN },
+    { 6, DRO_Y + DRO_ROW_H, 0, 0, &font_l, 2, "Y", C_CYAN },
+    { 6, DRO_Y + 2 * DRO_ROW_H, 0, 0, &font_l, 2, "Z", C_CYAN },
+    { 0, INFO_Y - 6, TFT_WIDTH, 2, NULL, 0, NULL, C_DGREY }
+};
+
+static const static_item_t menu_statics[] = {
+    { 0, BAR_H, TFT_WIDTH, 2, NULL, 0, NULL, C_DGREY },
+    { 112, 10, 0, 0, &font_m, 1, "MENU", C_WHITE }
+};
+
+static const static_item_t laser_statics[] = {
+    { 0, BAR_H, TFT_WIDTH, 2, NULL, 0, NULL, C_DGREY },
+    { 112, 10, 0, 0, &font_m, 1, "LASER TEST", C_WHITE },
+    { 10, 77, 0, 0, &font_s, 1, "POWER", C_GREY },
+    { 196, 77, 0, 0, &font_s, 1, "%", C_GREY },
+    { 10, 143, 0, 0, &font_s, 1, "TIME", C_GREY },
+    { 196, 143, 0, 0, &font_s, 1, "ms", C_GREY },
+    { 10, 194, 0, 0, &font_s, 1, "Laser! Wear safety goggles.", C_ORANGE }
+};
+
+static const static_item_t probe_statics[] = {
+    { 0, BAR_H, TFT_WIDTH, 2, NULL, 0, NULL, C_DGREY },
+    { 112, 10, 0, 0, &font_m, 1, "PROBE Z", C_WHITE },
+    { 10, 70, 0, 0, &font_s, 1, "PLATE", C_GREY },
+    { 180, 70, 0, 0, &font_s, 1, "mm", C_GREY },
+    { 10, 130, 0, 0, &font_s, 1, "FEED", C_GREY },
+    { 148, 130, 0, 0, &font_s, 1, "mm/min", C_GREY },
+    { 10, 178, 0, 0, &font_s, 1, "Clip on tool, contact = Z0 + plate", C_GREY }
+};
+
+static const static_item_t sd_statics[] = {
+    { 0, BAR_H, TFT_WIDTH, 2, NULL, 0, NULL, C_DGREY },
+    { 112, 10, 0, 0, &font_m, 1, "SD CARD", C_WHITE }
+};
+
+static const static_item_t set_statics[] = {
+    { 0, BAR_H, TFT_WIDTH, 2, NULL, 0, NULL, C_DGREY },
+    { 112, 10, 0, 0, &font_m, 1, "SETTINGS", C_WHITE }
+};
+
+static const static_item_t edit_statics[] = {
+    { 0, BAR_H, TFT_WIDTH, 2, NULL, 0, NULL, C_DGREY },
+    { 6, 120, 0, 0, &font_s, 1, "New:", C_GREY }
+};
+
+#define STATICS(a) statics = a; n_statics = N_VAL(a)
+
+static uint8_t mode_shown = 0xFF;   // machine mode ($32) currently shown
+
+static const char *mode_label (void)
+{
+    return settings.mode == Mode_Laser ? "MODE LASER" : (settings.mode == Mode_Lathe ? "MODE LATHE" : "MODE SPINDLE");
+}
+
+static bool list_keep = false;      // returning from a child screen: keep the list position
+static uint16_t top_mem[2];         // list positions of the settings group and settings lists
+static screen_t sd_back = Scr_Menu; // where BACK on the SD screen goes
+
+static void list_add_rows (void)
+{
+    field_add(260, (BAR_H - font_s.height) / 2, &font_s, 1, 18, C_GREY, C_BLACK);                       // F_ListMsg
+    button_add(0, 0, 96, BAR_H, "BACK", A_Back, Fire_OnRelease);
+    for(uint_fast8_t r = 0; r < LIST_ROWS; r++)
+        button_add(0, LIST_ROW_Y + r * LIST_ROW_H, TFT_WIDTH, LIST_ROW_H, "", (action_t)(A_Row0 + r), Fire_OnRelease)->style = Style_Row;
+}
+
+static void screen_build (screen_t scr)
+{
+    n_buttons = n_fields = 0;
+    touch_btn = -1;
+    *msg = '\0';
+    screen = scr;
+
+    switch(scr) {
+
+        case Scr_Main:
+            STATICS(main_statics);
+            field_add(STATE_X + 8, (BAR_H - font_m.height) / 2, &font_m, 1, 9, C_WHITE, C_GREEN);     // F_State
+            field_add(266, (BAR_H - font_s.height) / 2, &font_s, 1, 6, C_WHITE, C_BLACK);                // F_Feed
+            field_add(420, (BAR_H - font_s.height) / 2, &font_s, 1, 5, C_YELLOW, C_BLACK);               // F_Wcs
+            for(uint_fast8_t i = 0; i < 3; i++)                                                          // F_X, F_Y, F_Z
+                field_add(6 + 2 * font_l.width + 12, DRO_Y + i * DRO_ROW_H, &font_l, 2, 8, C_WHITE, C_BLACK);
+            field_add(6, INFO_Y, &font_s, 1, 38, C_GREY, C_BLACK);                                       // F_Info
+            field_add(346, (BAR_H - font_s.height) / 2, &font_s, 1, 5, C_CYAN, C_BLACK);                 // F_Mode
+            mode_shown = 0xFF;
+            button_add(0, 0, 96, BAR_H, "MENU", A_Menu, Fire_OnRelease);
+            button_add(0 * BTN_W, BTN_Y, BTN_W, BTN_H, "HOME", A_Home, Fire_LongPress);
+            button_add(1 * BTN_W, BTN_Y, BTN_W, BTN_H, "UNLOCK", A_Unlock, Fire_OnRelease);
+            button_add(2 * BTN_W, BTN_Y, BTN_W, BTN_H, "X0 Y0", A_ZeroXY, Fire_LongPress);
+            button_add(3 * BTN_W, BTN_Y, BTN_W, BTN_H, "Z0", A_ZeroZ, Fire_LongPress);
+            button_add(4 * BTN_W, BTN_Y, BTN_W, BTN_H, "HOLD", A_Hold, Fire_OnPress);
+            button_add(5 * BTN_W, BTN_Y, BTN_W, BTN_H, "START", A_Start, Fire_OnRelease);
+            state_bg = 0xFFFF;
+            break;
+
+        case Scr_Menu:
+            STATICS(menu_statics);
+            field_add(6, 50, &font_s, 1, 38, C_GREY, C_BLACK);                                          // F_Pos
+            button_add(0, 0, 96, BAR_H, "BACK", A_Back, Fire_OnRelease);
+            button_add(0,   80, 160, 78, "X=0", A_ZeroX, Fire_LongPress);
+            button_add(160, 80, 160, 78, "Y=0", A_ZeroY, Fire_LongPress);
+            button_add(320, 80, 160, 78, "XYZ=0", A_ZeroXYZ, Fire_LongPress);
+            button_add(0,   158, 160, 78, "PROBE Z", A_ScrProbe, Fire_OnRelease);
+            button_add(160, 158, 160, 78, "LASER", A_ScrLaser, Fire_OnRelease);
+            button_add(320, 158, 160, 78, "SD CARD", A_ScrSd, Fire_OnRelease);
+            button_add(0,   236, 160, 78, "SETTINGS", A_ScrSettings, Fire_OnRelease);
+            button_add(160, 236, 160, 78, "TOUCH CAL", A_TouchCal, Fire_LongPress);
+            button_add(320, 236, 160, 78, mode_label(), A_Mode, Fire_LongPress);
+            mode_shown = settings.mode;
+            break;
+
+        case Scr_Laser:
+            STATICS(laser_statics);
+            field_add(120, 77 - 2, &font_m, 1, 4, C_WHITE, C_BLACK);                                    // F_Val1
+            field_add(120, 143 - 2, &font_m, 1, 4, C_WHITE, C_BLACK);                                   // F_Val2
+            field_add(10, 220, &font_s, 1, 38, C_YELLOW, C_BLACK);                                      // F_Msg
+            button_add(0, 0, 96, BAR_H, "BACK", A_Back, Fire_OnRelease);
+            button_add(260, 56, 100, 60, "-", A_PwrDn, Fire_OnRelease);
+            button_add(370, 56, 100, 60, "+", A_PwrUp, Fire_OnRelease);
+            button_add(260, 122, 100, 60, "-", A_TimeDn, Fire_OnRelease);
+            button_add(370, 122, 100, 60, "+", A_TimeUp, Fire_OnRelease);
+            button_add(90, 248, 300, 70, "HOLD TO FIRE", A_Fire, Fire_LongPress)->style = Style_Danger;
+            strcpy(msg, "Idle only");
+            break;
+
+        case Scr_Probe:
+            STATICS(probe_statics);
+            field_add(80, 70 - 2, &font_m, 1, 6, C_WHITE, C_BLACK);                                     // F_Val1
+            field_add(80, 130 - 2, &font_m, 1, 4, C_WHITE, C_BLACK);                                    // F_Val2
+            field_add(10, 206, &font_s, 1, 38, C_YELLOW, C_BLACK);                                      // F_Msg
+            button_add(0, 0, 96, BAR_H, "BACK", A_Back, Fire_OnRelease);
+            button_add(228, 52, 63, 56, "-1", A_PlateDn1, Fire_OnRelease);
+            button_add(291, 52, 63, 56, "-.1", A_PlateDn01, Fire_OnRelease);
+            button_add(354, 52, 63, 56, "+.1", A_PlateUp01, Fire_OnRelease);
+            button_add(417, 52, 63, 56, "+1", A_PlateUp1, Fire_OnRelease);
+            button_add(260, 112, 100, 56, "-", A_FeedDn, Fire_OnRelease);
+            button_add(370, 112, 100, 56, "+", A_FeedUp, Fire_OnRelease);
+            button_add(90, 236, 300, 80, "HOLD TO PROBE", A_Probe, Fire_LongPress);
+            break;
+
+        case Scr_Sd:
+            STATICS(sd_statics);
+            list_add_rows();
+            button_add(0, 250, 160, 70, "UP", A_ListUp, Fire_OnRelease);
+            button_add(160, 250, 160, 70, "DOWN", A_ListDown, Fire_OnRelease);
+            button_add(320, 250, 160, 70, "RUN", A_SdRun, Fire_LongPress);
+            list_count = list_top = 0;
+            list_sel = -1;
+#if SDCARD_ENABLE
+            if(sdcard_getfs() == NULL)      // mounts the card if not mounted yet
+                strcpy(msg, "No card");
+            else if(!sd_scan())
+                strcpy(msg, "Read error");
+            else if(list_count == 0)
+                strcpy(msg, "No files");
+#else
+            strcpy(msg, "SD support off");
+#endif
+            list_update_rows();
+            break;
+
+        case Scr_SetGroups:
+            STATICS(set_statics);
+            list_add_rows();
+            button_add(0, 250, 240, 70, "UP", A_ListUp, Fire_OnRelease);
+            button_add(240, 250, 240, 70, "DOWN", A_ListDown, Fire_OnRelease);
+            if(!list_keep)
+                settings_collect();
+            list_count = grp_n;
+            list_top = list_keep ? top_mem[0] : 0;
+            list_sel = -1;
+            list_update_rows();
+            break;
+
+        case Scr_SetList:
+            STATICS(set_statics);
+            list_add_rows();
+            button_add(0, 250, 240, 70, "UP", A_ListUp, Fire_OnRelease);
+            button_add(240, 250, 240, 70, "DOWN", A_ListDown, Fire_OnRelease);
+            settings_view(grp_cur);
+            list_top = list_keep ? top_mem[1] : 0;
+            list_sel = -1;
+            list_update_rows();
+            break;
+
+        case Scr_SetEdit:
+            STATICS(edit_statics);
+            field_add(112, (BAR_H - font_m.height) / 2, &font_m, 1, 6, C_WHITE, C_BLACK);               // F_EdTitle
+            field_add(6, 48, &font_s, 1, 38, C_WHITE, C_BLACK);                                         // F_EdName
+            field_add(6, 72, &font_s, 1, 38, C_GREY, C_BLACK);                                          // F_EdNow
+            field_add(6, 96, &font_s, 1, 38, C_GREY, C_BLACK);                                          // F_EdHint
+            field_add(70, 120, &font_m, 1, 15, C_YELLOW, C_BLACK);                                      // F_EdEntry
+            field_add(220, (BAR_H - font_s.height) / 2, &font_s, 1, 21, C_YELLOW, C_BLACK);             // F_EdMsg
+            button_add(0, 0, 96, BAR_H, "BACK", A_Back, Fire_OnRelease);
+            {
+                static const char *const keys[16] = { "7", "8", "9", "DEL", "4", "5", "6", "CLR", "1", "2", "3", "-", "0", ".", "NOW", "SAVE" };
+                static const action_t acts[16] = { A_Key7, A_Key8, A_Key9, A_KeyDel, A_Key4, A_Key5, A_Key6, A_KeyClr,
+                                                   A_Key1, A_Key2, A_Key3, A_KeyMinus, A_Key0, A_KeyDot, A_KeyNow, A_Save };
+                for(uint_fast8_t k = 0; k < 16; k++)
+                    button_add((k % 4) * 120, 148 + (k / 4) * 43, 120, 43, keys[k], acts[k], acts[k] == A_Save ? Fire_LongPress : Fire_OnRelease);
+            }
+            *edit_buf = '\0';
+            verify_at = 0;
+            if(!set_editable(&set_all[set_cur]))
+                strcpy(msg, "Use the console");
+            break;
+    }
+
+    list_keep = false;
+}
+
+static void screen_switch (screen_t scr)
+{
+    if(params_dirty)
+        nvs_save();
+
+    next_screen = scr;
+    clear_row = 0;
+    phase = Tft_Clear;
+    phase_wait = 0;
+    touch_btn = -1;
+}
+
+static void state_info (sys_state_t state, char *text, uint16_t *bg)
+{
+    if(state & STATE_ESTOP) {
+        strcpy(text, "E-STOP");
+        *bg = C_RED;
+    } else if(state & STATE_ALARM) {
+        sprintf(text, "ALARM:%u", (unsigned)sys.alarm);
+        *bg = C_RED;
+    } else if(state & STATE_SAFETY_DOOR) {
+        strcpy(text, "DOOR");
+        *bg = C_ORANGE;
+    } else if(state & STATE_HOMING) {
+        strcpy(text, "HOMING");
+        *bg = C_BLUE;
+    } else if(state & STATE_HOLD) {
+        strcpy(text, "HOLD");
+        *bg = C_ORANGE;
+    } else if(state & STATE_TOOL_CHANGE) {
+        strcpy(text, "TOOL");
+        *bg = C_ORANGE;
+    } else if(state & STATE_JOG) {
+        strcpy(text, "JOG");
+        *bg = C_BLUE;
+    } else if(state & STATE_CYCLE) {
+        strcpy(text, "RUN");
+        *bg = C_BLUE;
+    } else if(state & STATE_CHECK_MODE) {
+        strcpy(text, "CHECK");
+        *bg = C_ORANGE;
+    } else if(state & STATE_SLEEP) {
+        strcpy(text, "SLEEP");
+        *bg = C_DGREY;
+    } else {
+        strcpy(text, "IDLE");
+        *bg = C_GREEN;
+    }
+}
+
+static void refresh_values (sys_state_t state)
+{
+    char buf[64];
+    float mpos[N_AXIS], wpos[3];
+    bool idle = state == STATE_IDLE;
+
+    system_convert_array_steps_to_mpos(mpos, sys.position);
+    for(uint_fast8_t i = 0; i < 3; i++)
+        wpos[i] = mpos[i] - gc_get_offset(i, true);
+
+    for(uint_fast8_t i = 0; i < n_buttons; i++) {
+        button_t *b = &buttons[i];
+        switch(b->action) {
+            case A_Home:      button_set_enabled(b, idle || (state & STATE_ALARM)); break;
+            case A_Unlock:    button_set_enabled(b, !!(state & STATE_ALARM)); break;
+            case A_ZeroXY:
+            case A_ZeroZ:
+            case A_ZeroX:
+            case A_ZeroY:
+            case A_ZeroXYZ:
+            case A_TouchCal:
+            case A_ScrSd:     button_set_enabled(b, idle); break;
+            case A_Hold:      button_set_enabled(b, !!(state & (STATE_CYCLE|STATE_JOG))); break;
+            case A_Start:
+                if(state & (STATE_HOLD|STATE_TOOL_CHANGE)) {
+                    b->fire = Fire_OnRelease;       // resume
+                    button_set_enabled(b, true);
+                } else {
+                    // tap: open the SD list, hold: run the selected file (see touch_release())
+                    b->fire = *sd_path ? Fire_LongPress : Fire_OnRelease;
+                    button_set_enabled(b, idle && TFT_SD);
+                }
+                break;
+            case A_Fire:      button_set_enabled(b, idle && !laser_active && !spindle_is_on()); break;
+            case A_Mode:
+                button_set_enabled(b, idle && !spindle_is_on());
+                if(mode_shown != settings.mode) {   // label follows $32, also when changed elsewhere
+                    mode_shown = settings.mode;
+                    b->label = mode_label();
+                    b->dirty = true;
+                }
+                break;
+            case A_Probe:     button_set_enabled(b, idle && !seq_active); break;
+            case A_SdRun:     button_set_enabled(b, idle && *sd_path); break;
+            case A_ListUp:    button_set_enabled(b, list_top > 0); break;
+            case A_ListDown:  button_set_enabled(b, list_top + LIST_ROWS < list_count); break;
+            case A_KeyDot:    button_set_enabled(b, set_all[set_cur].setting->datatype == Format_Decimal); break;
+            case A_Save:      button_set_enabled(b, (idle || (state & STATE_ALARM)) && set_editable(&set_all[set_cur]) && *edit_buf); break;
+            default:          if(b->style != Style_Row) button_set_enabled(b, true); break;
+        }
+    }
+
+    switch(screen) {
+
+        case Scr_Main:
+            {
+                uint16_t bg;
+                state_info(state, buf, &bg);
+                if(bg != state_bg) {
+                    state_bg = bg;
+                    fields[F_State].bg = bg;
+                    field_invalidate(F_State);
+                    bar_dirty = true;
+                }
+                field_set(F_State, buf);
+            }
+
+            snprintf(buf, sizeof(buf), "F%5.0f", st_get_realtime_rate());
+            field_set(F_Feed, buf);
+
+            if(mode_shown != settings.mode) {
+                mode_shown = settings.mode;
+                fields[F_Mode].fg = settings.mode == Mode_Laser ? C_ORANGE : C_CYAN;
+                field_invalidate(F_Mode);
+                field_set(F_Mode, settings.mode == Mode_Laser ? "LASER" : (settings.mode == Mode_Lathe ? "LATHE" : "SPIN"));
+            }
+            field_set(F_Wcs, gc_coord_system_to_str(gc_state.modal.g5x_offset.id));
+
+            for(uint_fast8_t i = 0; i < 3; i++) {
+                snprintf(buf, sizeof(buf), "%8.3f", wpos[i]);
+                field_set(F_X + i, buf);
+            }
+
+#if SDCARD_ENABLE
+            stream_job_t *job;
+            if((job = stream_get_job_info()) && job->size)
+                snprintf(buf, sizeof(buf), "SD %5.1f%% %s", (float)job->pos * 100.0f / (float)job->size, job->name);
+            else
+#endif
+            if(*sd_path && idle)
+                snprintf(buf, sizeof(buf), "File: %s", sd_path + 1);
+            else
+                snprintf(buf, sizeof(buf), "MPos X%8.3f Y%8.3f Z%8.3f", mpos[0], mpos[1], mpos[2]);
+            field_set(F_Info, buf);
+            break;
+
+        case Scr_Menu:
+            snprintf(buf, sizeof(buf), "X%8.3f  Y%8.3f  Z%8.3f", wpos[0], wpos[1], wpos[2]);
+            field_set(F_Pos, buf);
+            break;
+
+        case Scr_Laser:
+            snprintf(buf, sizeof(buf), "%4u", (unsigned)laser_pwr_val[nvs.laser_pwr]);
+            field_set(F_Val1, buf);
+            snprintf(buf, sizeof(buf), "%4u", (unsigned)laser_time_val[nvs.laser_time]);
+            field_set(F_Val2, buf);
+            field_set(F_Msg, msg);
+            break;
+
+        case Scr_Probe:
+            snprintf(buf, sizeof(buf), "%6.2f", nvs.plate);
+            field_set(F_Val1, buf);
+            snprintf(buf, sizeof(buf), "%4u", (unsigned)probe_feed_val[nvs.probe_feed]);
+            field_set(F_Val2, buf);
+            field_set(F_Msg, msg);
+            break;
+
+        case Scr_Sd:
+        case Scr_SetGroups:
+        case Scr_SetList:
+            field_set(F_ListMsg, msg);
+            break;
+
+        case Scr_SetEdit:
+            {
+                const set_entry_t *e = &set_all[set_cur];
+                const setting_detail_t *s = e->setting;
+                char name[40];
+
+                snprintf(buf, sizeof(buf), "$%u", (unsigned)set_id(e));
+                field_set(F_EdTitle, buf);
+                set_name(e, name, sizeof(name));
+                field_set(F_EdName, name);
+                snprintf(buf, sizeof(buf), "Now: %s %s", set_value(e), s->unit ? s->unit : "");
+                field_set(F_EdNow, buf);
+
+                switch(s->datatype) {
+                    case Format_Bool:
+                        strcpy(buf, "0 = off, 1 = on");
+                        break;
+                    case Format_Bitfield:
+                    case Format_XBitfield:
+                    case Format_RadioButtons:
+                        snprintf(buf, sizeof(buf), "%s", s->format ? s->format : "");
+                        break;
+                    case Format_AxisMask:
+                        strcpy(buf, "Bits: 1 = X, 2 = Y, 4 = Z");
+                        break;
+                    default:
+                        if(s->min_value || s->max_value)
+                            snprintf(buf, sizeof(buf), "Range: %s .. %s", s->min_value ? s->min_value : "", s->max_value ? s->max_value : "");
+                        else
+                            *buf = '\0';
+                        break;
+                }
+                field_set(F_EdHint, buf);
+                field_set(F_EdEntry, edit_buf);
+
+                // Check that a saved value was accepted.
+                if(verify_at && (int32_t)(hal.get_elapsed_ticks() - verify_at) >= 0) {
+                    verify_at = 0;
+                    if(fabsf(strtof(set_value(e), NULL) - strtof(edit_buf, NULL)) < 0.0005f)
+                        strcpy(msg, s->flags.reboot_required ? "Saved, restart!" : "Saved");
+                    else
+                        strcpy(msg, "Not accepted");
+                }
+                field_set(F_EdMsg, msg);
+            }
+            break;
+    }
+}
+
+static void action_run (button_t *b)
+{
+    switch(b->action) {
+
+        case A_Menu:      screen_switch(Scr_Menu); break;
+
+        case A_Back:
+            switch(screen) {
+                case Scr_Menu:      screen_switch(Scr_Main); break;
+                case Scr_Sd:        screen_switch(sd_back); break;
+                case Scr_SetList:   list_keep = true; screen_switch(Scr_SetGroups); break;
+                case Scr_SetEdit:   list_keep = true; screen_switch(Scr_SetList); break;
+                default:            screen_switch(Scr_Menu); break;
+            }
+            break;
+
+        case A_ScrProbe:  screen_switch(Scr_Probe); break;
+        case A_ScrLaser:  screen_switch(Scr_Laser); break;
+        case A_ScrSd:     sd_back = Scr_Menu; screen_switch(Scr_Sd); break;
+        case A_ScrSettings: screen_switch(Scr_SetGroups); break;
+
+        case A_Mode:      // toggle spindle <-> laser mode ($32)
+            enqueue(settings.mode == Mode_Laser ? "$32=0" : "$32=1");
+            break;
+        case A_TouchCal:  phase = Tft_CalStart; phase_wait = 0; break;
+
+        case A_Home:      enqueue("$H"); break;
+        case A_Unlock:    enqueue("$X"); break;
+        case A_ZeroXY:    enqueue("G10L20P0X0Y0"); break;
+        case A_ZeroZ:     enqueue("G10L20P0Z0"); break;
+        case A_ZeroX:     enqueue("G10L20P0X0"); break;
+        case A_ZeroY:     enqueue("G10L20P0Y0"); break;
+        case A_ZeroXYZ:   enqueue("G10L20P0X0Y0Z0"); break;
+        case A_Hold:      grbl.enqueue_realtime_command(CMD_FEED_HOLD); break;
+
+        case A_Start:
+            if(state_get() & (STATE_HOLD|STATE_TOOL_CHANGE))
+                grbl.enqueue_realtime_command(CMD_CYCLE_START);
+            else if(*sd_path && b->fired) {     // held: run the selected file
+                char cmd[48];
+                snprintf(cmd, sizeof(cmd), "$F=%s", sd_path);
+                enqueue(cmd);
+            } else {                            // tapped: choose a file
+                sd_back = Scr_Main;
+                screen_switch(Scr_Sd);
+            }
+            break;
+
+        case A_PwrDn:     if(nvs.laser_pwr > 0) { nvs.laser_pwr--; params_dirty = true; } break;
+        case A_PwrUp:     if(nvs.laser_pwr < N_VAL(laser_pwr_val) - 1) { nvs.laser_pwr++; params_dirty = true; } break;
+        case A_TimeDn:    if(nvs.laser_time > 0) { nvs.laser_time--; params_dirty = true; } break;
+        case A_TimeUp:    if(nvs.laser_time < N_VAL(laser_time_val) - 1) { nvs.laser_time++; params_dirty = true; } break;
+        case A_Fire:      laser_fire(); break;
+
+        case A_PlateDn1:  nvs.plate = fmaxf(0.0f, nvs.plate - 1.0f); params_dirty = true; break;
+        case A_PlateDn01: nvs.plate = fmaxf(0.0f, nvs.plate - 0.1f); params_dirty = true; break;
+        case A_PlateUp01: nvs.plate = fminf(50.0f, nvs.plate + 0.1f); params_dirty = true; break;
+        case A_PlateUp1:  nvs.plate = fminf(50.0f, nvs.plate + 1.0f); params_dirty = true; break;
+        case A_FeedDn:    if(nvs.probe_feed > 0) { nvs.probe_feed--; params_dirty = true; } break;
+        case A_FeedUp:    if(nvs.probe_feed < N_VAL(probe_feed_val) - 1) { nvs.probe_feed++; params_dirty = true; } break;
+        case A_Probe:     probe_start(); break;
+
+        case A_ListUp:
+            list_top = list_top >= LIST_ROWS ? list_top - LIST_ROWS : 0;
+            list_update_rows();
+            break;
+
+        case A_ListDown:
+            if(list_top + LIST_ROWS < list_count)
+                list_top += LIST_ROWS;
+            list_update_rows();
+            break;
+
+        case A_SdRun:
+            if(*sd_path) {
+                char cmd[48];
+                snprintf(cmd, sizeof(cmd), "$F=%s", sd_path);
+                if(enqueue(cmd))
+                    screen_switch(Scr_Main);
+            }
+            break;
+
+        case A_Key0: case A_Key1: case A_Key2: case A_Key3: case A_Key4:
+        case A_Key5: case A_Key6: case A_Key7: case A_Key8: case A_Key9:
+            edit_key('0' + (b->action - A_Key0));
+            break;
+
+        case A_KeyDot:    edit_key('.'); break;
+        case A_KeyMinus:  edit_key('-'); break;
+        case A_KeyDel:    edit_key('<'); break;
+        case A_KeyClr:    edit_key('C'); break;
+
+        case A_KeyNow:
+            snprintf(edit_buf, sizeof(edit_buf), "%s", set_value(&set_all[set_cur]));
+            break;
+
+        case A_Save:
+            {
+                char cmd[32];
+                snprintf(cmd, sizeof(cmd), "$%u=%s", (unsigned)set_id(&set_all[set_cur]), edit_buf);
+                if(enqueue(cmd)) {
+                    verify_at = hal.get_elapsed_ticks() + 300;
+                    strcpy(msg, "Saving...");
+                } else
+                    strcpy(msg, "Busy, try again");
+            }
+            break;
+
+        default:
+            if(b->action >= A_Row0 && b->action < A_Row0 + LIST_ROWS) {
+
+                uint16_t i = list_top + (b->action - A_Row0);
+
+                if(i >= list_count)
+                    break;
+
+                switch(screen) {
+
+#if SDCARD_ENABLE
+                    case Scr_Sd:
+                        list_sel = i;
+                        snprintf(sd_path, sizeof(sd_path), "/%s", sd_files[i]);
+                        list_update_rows();
+                        strcpy(msg, "Hold RUN to start");
+                        break;
+#endif
+
+                    case Scr_SetGroups:
+                        top_mem[0] = list_top;
+                        grp_cur = i;
+                        screen_switch(Scr_SetList);
+                        break;
+
+                    case Scr_SetList:
+                        top_mem[1] = list_top;
+                        set_cur = set_view[i];
+                        screen_switch(Scr_SetEdit);
+                        break;
+
+                    default:
+                        break;
+                }
+            }
+            break;
+    }
+}
+
+static void touch_release (void)
+{
+    if(touch_btn >= 0 && touch_btn < n_buttons) {
+        button_t *b = &buttons[touch_btn];
+        // START with a file selected: released before the long press time = tap, opens the file list
+        bool tap = b->fire == Fire_OnRelease || (b->action == A_Start && b->fire == Fire_LongPress);
+        if(tap && b->enabled && !b->fired) {
+            b->pressed = false;
+            b->dirty = true;
+            touch_btn = -1;
+            action_run(b);  // may switch screens
+            return;
+        }
+        b->pressed = b->fired = false;
+        b->dirty = true;
+    }
+    touch_btn = -1;
+    touch_on_bar = false;
+}
+
+static bool inside (const button_t *b, int16_t x, int16_t y)
+{
+    return x >= b->x && x < b->x + b->w && y >= b->y && y < b->y + b->h;
+}
+
+// Returns true if recalibration was requested.
+static bool touch_poll (uint32_t now)
+{
+    if(now - last_touch_poll < TOUCH_POLL_MS)
+        return false;
+
+    last_touch_poll = now;
+
+    int16_t rx, ry;
+
+    if(!touch_read_raw(&rx, &ry)) {
+        if(touch_down && ++touch_up_count >= 3) {
+            touch_down = false;
+            touch_release();
+        }
+        return false;
+    }
+
+    touch_up_count = 0;
+    touch_to_screen(rx, ry, &touch_x, &touch_y);
+
+    if(!touch_down) {
+
+        touch_down = true;
+        touch_down_ms = now;
+        touch_btn = -1;
+        touch_on_bar = screen == Scr_Main && touch_y >= 0 && touch_y < BAR_H && touch_x >= STATE_X;
+
+        for(uint_fast8_t i = 0; i < n_buttons; i++) {
+            button_t *b = &buttons[i];
+            if(b->enabled && inside(b, touch_x, touch_y)) {
+                touch_btn = i;
+                b->pressed = true;
+                b->dirty = true;
+                if(b->fire == Fire_OnPress) {
+                    b->fired = true;
+                    action_run(b);
+                }
+                break;
+            }
+        }
+    } else {
+
+        if(touch_btn >= 0) {
+            button_t *b = &buttons[touch_btn];
+            if(!inside(b, touch_x, touch_y)) {      // finger slid off the button: cancel
+                b->pressed = b->fired = false;
+                b->dirty = true;
+                touch_btn = -1;
+            } else if(b->fire == Fire_LongPress && !b->fired && b->enabled && now - touch_down_ms >= TFT_LONG_PRESS_MS) {
+                b->fired = true;
+                b->dirty = true;
+                action_run(b);
+            }
+        }
+
+        if(touch_on_bar && now - touch_down_ms >= TFT_CAL_HOLD_MS && state_get() == STATE_IDLE) {
+            touch_on_bar = false;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// Static parts of the current screen, one element per call. Returns true when done.
+static bool static_draw_step (void)
+{
+    if(static_step < n_statics) {
+        const static_item_t *s = &statics[static_step++];
+        if(s->font)
+            tft_text(s->font, s->scale, s->x, s->y, s->text, s->color, C_BLACK);
+        else
+            tft_fill(s->x, s->y, s->w, s->h, s->color);
+        return false;
+    }
+
+    return true;
+}
+
+// ------------------------------------------------------------------------
+// Realtime loop
+// ------------------------------------------------------------------------
+
+static void phase_set (tft_phase_t p, uint32_t now, uint32_t wait)
+{
+    phase = p;
+    phase_ms = now;
+    phase_wait = wait;
+}
+
+static void tft_realtime (sys_state_t state)
+{
+    if(on_execute_realtime)
+        on_execute_realtime(state);
+
+    uint32_t now = hal.get_elapsed_ticks();
+
+    // Laser pulse running: nothing else, so the timing stays accurate.
+    if(laser_active) {
+        if(state != STATE_IDLE || now - laser_start >= laser_dur) {
+            laser_stop();
+            if(state != STATE_IDLE)
+                strcpy(msg, "Pulse aborted");
+        }
+        return;
+    }
+
+    seq_poll(state, now);
+
+    if(phase_wait && (now - phase_ms) < phase_wait)
+        return;
+
+    switch(phase) {
+
+        case Tft_Off:
+            hw_init();
+            nvs_load();
+            phase_set(Tft_Reset, now, 20);  // reset is held low
+            break;
+
+        case Tft_Reset:
+            PIN_HI(TFT_RST);
+            phase_set(Tft_SwReset, now, 150);
+            break;
+
+        case Tft_SwReset:
+            tft_begin();
+            tft_cmd(0x01);
+            tft_end();
+            phase_set(Tft_SleepOut, now, 150);
+            break;
+
+        case Tft_SleepOut:
+            tft_begin();
+            tft_cmd(0x11);
+            tft_end();
+            phase_set(Tft_Config, now, 150);
+            break;
+
+        case Tft_Config:
+            tft_config();
+            clear_row = 0;
+            phase_set(Tft_Clear, now, 0);
+            break;
+
+        case Tft_Clear:
+            tft_fill(0, clear_row, TFT_WIDTH, 16, C_BLACK);
+            if(clear_row == 0)
+                PIN_HI(TFT_BL);
+            if((clear_row += 16) >= TFT_HEIGHT) {
+                if(cal_valid()) {
+                    static_step = 0;
+                    bar_dirty = false;
+                    screen_build(next_screen);
+                    phase_set(Tft_Static, now, 0);
+                } else
+                    phase_set(Tft_CalStart, now, 0);
+            }
+            break;
+
+        case Tft_CalStart:
+            if(TOUCH_DOWN())        // wait until the finger that started calibration is lifted
+                break;
+            cal_point = 0;
+            cal_drawn = false;
+            touch_down = false;
+            touch_btn = -1;
+            phase_set(Tft_Cal, now, 0);
+            break;
+
+        case Tft_Cal:
+            if(cal_run(now)) {
+                clear_row = 0;
+                phase_set(Tft_Clear, now, 0);
+            }
+            break;
+
+        case Tft_Static:
+            if(static_draw_step()) {
+                last_refresh = 0;
+                phase_set(Tft_Run, now, 0);
+            }
+            break;
+
+        case Tft_Run:
+
+            if(touch_poll(now)) {
+                touch_down = false;
+                touch_release();
+                phase_set(Tft_CalStart, now, 0);
+                break;
+            }
+
+            if(phase != Tft_Run)    // a button switched the screen or started calibration
+                break;
+
+            if(now - last_refresh >= TFT_REFRESH_MS || last_refresh == 0) {
+                last_refresh = now;
+                refresh_values(state);
+            }
+
+            if(bar_dirty) {
+                tft_fill(STATE_X, 0, STATE_W, BAR_H, state_bg);
+                bar_dirty = false;
+                break;
+            }
+
+            for(uint_fast8_t i = 0; i < n_buttons; i++) {
+                if(buttons[i].dirty) {
+                    button_draw(&buttons[i]);
+                    return;
+                }
+            }
+
+            fields_draw_one();
+            break;
+
+        default:
+            break;
+    }
+}
+
+static void tft_report_options (bool newopt)
+{
+    on_report_options(newopt);
+
+    if(!newopt)
+        report_plugin("TFT display", TFT_VERSION);
+}
+
+void tft_display_init (void)
+{
+    if(hal.nvs.type != NVS_None)
+        nvs_address = nvs_alloc(sizeof(tft_nvs_t));
+
+    on_execute_realtime = grbl.on_execute_realtime;
+    grbl.on_execute_realtime = tft_realtime;
+
+    on_report_options = grbl.on_report_options;
+    grbl.on_report_options = tft_report_options;
+}

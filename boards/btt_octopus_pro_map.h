@@ -171,7 +171,7 @@
 #define AUXOUTPUT4_PORT             GPIOA       // Spindle/laser enable - Bed-out (as in Marlin: HEATER_BED_PIN)
 #define AUXOUTPUT4_PIN              1
 
-#define AUXOUTPUT5_PORT             GPIOE       // Spindle direction - FAN5 (NOTE: Marlin lists FAN5 as PD15)
+#define AUXOUTPUT5_PORT             GPIOD       // Spindle direction - FAN5 (PD15 as in Marlin, PE15 is TFT DC on EXP1)
 #define AUXOUTPUT5_PIN              15
 
 #define AUXOUTPUT6_PORT             GPIOA       // Coolant flood - HE0 (v1.0: PA2)
@@ -278,10 +278,12 @@
 
 #if SDCARD_ENABLE
 #define SDCARD_SDIO                 1
-#ifndef M6_LIMIT_PORT
-#define SD_DETECT_PORT              GPIOC
-#define SD_DETECT_PIN               14
-#endif
+// Card detect disabled: on the Octopus PC14 is high with a card inserted (see Marlin SD_DETECT_STATE HIGH),
+// grblHAL expects low. With it enabled inserting a card unmounts it. The card is mounted on demand instead.
+//#ifndef M6_LIMIT_PORT
+//#define SD_DETECT_PORT              GPIOC
+//#define SD_DETECT_PIN               14
+//#endif
 #endif
 
 //Pins not used

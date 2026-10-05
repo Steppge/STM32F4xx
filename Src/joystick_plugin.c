@@ -1,7 +1,7 @@
 /*
   joystick_plugin.c - analog joystick jogging for grblHAL (STM32F4xx, BTT Octopus Pro)
 
-  PROTOTYPE v0.2 - tested only in short bench runs. Keep a hand on the power switch.
+  PROTOTYPE v0.3 - tested only in short bench runs. Keep a hand on the power switch.
 
   Reads three analog inputs (X, Y, Z stick) plus one digital enable input (PG15).
   While the enable switch is held and a stick is out of its dead zone, the plugin
@@ -16,6 +16,13 @@
 
   Changes in v0.2:
    - jog is sent as short segments, speed changes no longer stop and restart the motion
+
+  Changes in v0.3:
+   - a new segment is only queued when the planner holds less than JOY_MAX_QUEUED blocks.
+     v0.2 queued segments faster than they were executed, so the planner filled up with
+     full speed motion and slowing down the stick had (almost) no effect.
+   - segment length is at least the braking distance (from $120-$122), so the motion
+     stays smooth with the short queue.
 */
 
 #include "driver.h"
@@ -29,8 +36,10 @@
 #include "grbl/protocol.h"
 #include "grbl/state_machine.h"
 #include "grbl/ioports.h"
+#include "grbl/planner.h"
+#include "grbl/settings.h"
 
-#define JOY_VERSION "0.2"
+#define JOY_VERSION "0.3"
 
 // ------------------------------------------------------------------------
 // Configuration - adjust to your sticks
@@ -66,8 +75,9 @@ static const joy_axis_cfg_t joy_cfg[3] = {
 
 #define JOY_LEVELS            20    // speed is quantised to 1/JOY_LEVELS steps
 #define JOY_POLL_MS           20    // stick sampling interval
-#define JOY_SEG_TIME_S      0.25f   // travel time covered by one jog segment (seconds)
-#define JOY_SEG_PERIOD_MS    120    // a new segment is queued this often (must be < JOY_SEG_TIME_S)
+#define JOY_SEG_TIME_S      0.10f   // travel time covered by one jog segment (seconds), lower = faster response
+#define JOY_MAX_QUEUED         2    // max. planner blocks (incl. the running one) before a new segment is sent
+#define JOY_BRAKE_MARGIN    1.2f    // segment is at least this times the braking distance
 #define JOY_ENABLE_ACTIVE_LOW  1    // 1: enable switch pulls the input low
 
 // Enable switch on PG15 (Stop7), read directly from the GPIO register.
@@ -96,7 +106,7 @@ static uint8_t dbg_analog = 0, dbg_port = IOPORT_UNASSIGNED;
 static bool jogging = false;        // a jog started by this plugin is active
 static bool cancel_sent = false;
 static int8_t sent_sign[3] = {0};   // direction pattern of the running jog
-static uint32_t last_poll = 0, last_send = 0;
+static uint32_t last_poll = 0;
 
 static float normalize (int32_t raw, const joy_axis_cfg_t *c)
 {
@@ -179,6 +189,20 @@ static void send_segment (const int8_t q[3])
 
     float dist = feed / 60.0f * JOY_SEG_TIME_S; // total path length of the segment, mm
 
+    // The planner must be able to stop at the end of the queued motion, a segment shorter than
+    // the braking distance would make it slow down before the next one arrives (stutter).
+    // Use the lowest acceleration of the moving axes, settings are in mm/min^2.
+    float accel = 0.0f;
+    for(uint_fast8_t i = 0; i < 3; i++) {
+        if(q[i] && (accel == 0.0f || settings.axis[i].acceleration < accel))
+            accel = settings.axis[i].acceleration;
+    }
+    if(accel > 0.0f) {
+        float brake = feed * feed / (2.0f * accel) * JOY_BRAKE_MARGIN;
+        if(dist < brake)
+            dist = brake;
+    }
+
     char cmd[80] = "$J=G91G21";
     char *p = cmd + strlen(cmd);
 
@@ -193,7 +217,6 @@ static void send_segment (const int8_t q[3])
         for(uint_fast8_t i = 0; i < 3; i++)
             sent_sign[i] = sgn(q[i]);
         jogging = true;
-        last_send = hal.get_elapsed_ticks();
     }
 }
 
@@ -254,8 +277,9 @@ static void joy_realtime (sys_state_t state)
         return;
     }
 
-    // Same direction (or idle): keep feeding segments. Speed changes apply from the next segment on.
-    if((now - last_send) >= JOY_SEG_PERIOD_MS)
+    // Same direction (or idle): keep feeding segments, but keep the planner queue short so
+    // speed changes take effect after at most JOY_MAX_QUEUED segments.
+    if((plan_get_buffer_size() - plan_get_block_buffer_available()) < JOY_MAX_QUEUED)
         send_segment(q);
 }
 
@@ -332,4 +356,7 @@ void my_plugin_init (void)
     on_realtime_report = grbl.on_realtime_report;
     grbl.on_realtime_report = joy_realtime_report;
 #endif
+
+    extern void tft_display_init (void);
+    tft_display_init(); // MKS TS35 status display, see tft_display.c
 }
