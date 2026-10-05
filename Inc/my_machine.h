@@ -23,7 +23,7 @@
 // If none is enabled pin mappings from generic_map.h will be used.
 //#define BOARD_BLACKPILL           // For use with F411 BlackPill, with optional auto square support for one axis
 //#define BOARD_BLACKPILL_ALT2      // For use with F411 BlackPill, with optional auto square support for one axis, I2C and spindle sync
-//#define BOARD_BTT_OCTOPUS_PRO     // F446 based 3D Printer board
+#define BOARD_BTT_OCTOPUS_PRO     // F446 based 3D Printer board
 //#define BOARD_BTT_SKR_20          // F407 based 3D Printer board
 //#define BOARD_BTT_SKR_20_DAC      // F407 based 3D Printer board, uses analog output (DAC) for spindle speed control
 //#define BOARD_BTT_SKR_PRO_1_1     // F407 based 3D Printer board
@@ -47,6 +47,7 @@
 //#define BOARD_STM32F401_UNI       // F401 CNC board
 //#define BOARD_STM32F407VET6_DEV   // F407 based industrial control board
 //#define BOARD_MY_MACHINE          // Add my_machine_map.h before enabling this!
+
 
 // WARNING: BOARD_BTT_SKR_20 may fry your Trinamic drivers due to bad hardware design.
 //          The risk goes away if Q1 (HY1904C2) is shorted between source (S) and drain (D).
@@ -74,7 +75,8 @@
 // If none are specified the default PWM spindle is instantiated.
 // Spindle definitions can be found in grbl/spindle_control.h.
 // More here https://github.com/grblHAL/Plugins_spindle
-//#define SPINDLE0_ENABLE         SPINDLE_HUANYANG1
+#define SPINDLE0_ENABLE SPINDLE_PWM0_NODIR
+#define DEFAULT_SPINDLE_INVERT_MASK 4
 //#define SPINDLE1_ENABLE         SPINDLE_PWM0
 //#define SPINDLE2_ENABLE         SPINDLE_NONE
 //#define SPINDLE3_ENABLE         SPINDLE_NONE
@@ -106,17 +108,33 @@
 //#define OPENPNP_ENABLE          1 // OpenPNP plugin. To be completed.
 //#define TRINAMIC_ENABLE      2130 // Trinamic TMC2130 stepper driver support.
 //#define TRINAMIC_ENABLE      5160 // Trinamic TMC5160 stepper driver support.
-//#define TRINAMIC_ENABLE      2209 // Trinamic TMC2209 stepper driver support.
-//#define TRINAMIC_ENABLE      2660 // Trinamic TMC2660 stepper driver support.
-//#define TRINAMIC_R_SENSE      110 // R sense resistance in milliohms, 2130 and 2209 default is 110, 5160 is 75.
+#define TRINAMIC_ENABLE               2209
+#define TRINAMIC_R_SENSE              110
+
+#define TMC_X_CURRENT                 1800
+#define TMC_Y_CURRENT                 1300
+#define TMC_Z_CURRENT                 1400
+
+#define TMC_X_HOLD_CURRENT_PCT        50
+#define TMC_Y_HOLD_CURRENT_PCT        50
+#define TMC_Z_HOLD_CURRENT_PCT        50
+
+#define TMC_X_MICROSTEPS              16
+#define TMC_Y_MICROSTEPS              16
+#define TMC_Z_MICROSTEPS              16
+
+#define TMC_X_STEALTHCHOP             0
+#define TMC_Y_STEALTHCHOP             0
+#define TMC_Z_STEALTHCHOP             0
 //#define TRINAMIC_ENABLE      2240 // Trinamic TMC2240 stepper driver support.
 //#define TRINAMIC_R_REF         12 // R ref resistance in kiloohms, used for 2240 - default value is 12.
 //#define TRINAMIC_I2C            1 // Trinamic I2C - SPI bridge interface.
 //#define TRINAMIC_DEV            1 // Development mode, adds a few M-codes to aid debugging. Do not enable in production code.
+#define TRINAMIC_UART_ENABLE    2
 //#define FANS_ENABLE             1 // Enable fan control via M106/M107. Enables fans plugin.
-//#define EEPROM_ENABLE          16 // I2C EEPROM/FRAM support. Set to 16 for 2K, 32 for 4K, 64 for 8K, 128 for 16K and 256 for 32K capacity.
+#define EEPROM_ENABLE           32 // Onboard AT24C32, 4 KiB I2C EEPROM.
 //#define EEPROM_IS_FRAM          1 // Uncomment when EEPROM is enabled and chip is FRAM, this to remove write delay.
-//#define ESTOP_ENABLE            0 // When enabled only real-time report requests will be executed when the reset pin is asserted.
+#define ESTOP_ENABLE            0 // When enabled only real-time report requests will be executed when the reset pin is asserted.
                                     // Note: if left commented out the default setting is determined from COMPATIBILITY_LEVEL.
 //#define RGB_LED_ENABLE          2 // Set to 1 to enable strip length settings $536 and $537, set to 2 to also enable M150 LED strip control.
 //#define PWM_SERVO_ENABLE        1 // Enable M280 PWM servo support, requires at least one PWM capable auxiliary output.
@@ -151,14 +169,15 @@
 //#define BLOCK_DELETE_ENABLE     1
 //#define SINGLE_BLOCK_ENABLE     1
 //#define LIMITS_OVERRIDE_ENABLE  1
-
+#define NGC_EXPRESSIONS_ENABLE 1
+#define CONTROL_ENABLE (CONTROL_HALT|CONTROL_FEED_HOLD)
 /**/
 // If the selected board map supports more than three motors ganging and/or auto-squaring
 // of axes can be enabled here.
 //#define X_GANGED            1
 //#define X_AUTO_SQUARE       1
-//#define Y_GANGED            1
-//#define Y_AUTO_SQUARE       1
+#define Y_GANGED            1
+#define Y_AUTO_SQUARE       1
 //#define Z_GANGED            1
 //#define Z_AUTO_SQUARE       1
 // For ganged axes the limit switch input (if available) can be configured to act as a max travel limit switch.

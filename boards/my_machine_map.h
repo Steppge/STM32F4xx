@@ -1,4 +1,3 @@
-  /*
   my_machine_map.h - Board map for BIGTREETECH Octopus Pro v1.0 (F446, 12 MHz)
 
   Based on btt_octopus_pro_map.h (v1.1). Only pins that differ for the
@@ -240,17 +239,14 @@
 #define AUXINPUT4_PIN               3
 #define AUXINPUT5_PORT              GPIOF       // Feed hold - T0
 #define AUXINPUT5_PIN               4
-//#define AUXINPUT6_PORT              GPIOF       // Cycle start - T1
-//#define AUXINPUT6_PIN               5
-#define AUXINPUT7_PORT              GPIOG       // Joystick enable (Stop7)
-#define AUXINPUT7_PIN               15
+#define AUXINPUT6_PORT              GPIOF       // Cycle start - T1
+#define AUXINPUT6_PIN               5
 
-#define AUXINPUT0_ANALOG_PORT       GPIOF       // TH1 = X stick
-#define AUXINPUT0_ANALOG_PIN        5
-#define AUXINPUT1_ANALOG_PORT       GPIOF       // TH2 = Y stick
-#define AUXINPUT1_ANALOG_PIN        6
-#define AUXINPUT2_ANALOG_PORT       GPIOF       // TH3 = Z stick
-#define AUXINPUT2_ANALOG_PIN        7
+#define AUXINTPUT0_ANALOG_PORT      GPIOF       // T2
+#define AUXINTPUT0_ANALOG_PIN       6
+
+#define AUXINTPUT1_ANALOG_PORT      GPIOF       // T3
+#define AUXINTPUT1_ANALOG_PIN       7
 
 // Define user-control controls (cycle start, reset, feed hold) input pins.
 #if CONTROL_ENABLE & CONTROL_HALT
@@ -261,10 +257,10 @@
 #define FEED_HOLD_PORT              AUXINPUT5_PORT
 #define FEED_HOLD_PIN               AUXINPUT5_PIN
 #endif
-//#if CONTROL_ENABLE & CONTROL_CYCLE_START
-//#define CYCLE_START_PORT            AUXINPUT6_PORT
-//#define CYCLE_START_PIN             AUXINPUT6_PIN
-//#endif
+#if CONTROL_ENABLE & CONTROL_CYCLE_START
+#define CYCLE_START_PORT            AUXINPUT6_PORT
+#define CYCLE_START_PIN             AUXINPUT6_PIN
+#endif
 
 #if SAFETY_DOOR_ENABLE
 #define SAFETY_DOOR_PORT            AUXINPUT0_PORT
