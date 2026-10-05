@@ -448,6 +448,10 @@ static void tft_cmd (uint8_t cmd)
 
 static void tft_begin (void)
 {
+    // SPI1 is shared with the Trinamic drivers (SPI mode, e.g. TMC5160) which set their own clock divider.
+    if((SPI1->CR1 & (SPI_CR1_BR | SPI_CR1_CPOL | SPI_CR1_CPHA)) != (br_tft << SPI_CR1_BR_Pos))
+        spi_set_br(br_tft);
+
     PIN_LO(TFT_CS);
 }
 
