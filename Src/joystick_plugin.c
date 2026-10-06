@@ -39,7 +39,7 @@
 #include "grbl/planner.h"
 #include "grbl/settings.h"
 
-#define JOY_VERSION "0.3"
+#define JOY_VERSION "0.4"
 
 // ------------------------------------------------------------------------
 // Configuration - adjust to your sticks
@@ -100,6 +100,7 @@ static on_realtime_report_ptr on_realtime_report;
 #endif
 
 static bool ready = false;
+static bool armed = false;          // start lock released, all sticks were seen centered after power-up
 static uint8_t enable_port = IOPORT_UNASSIGNED;
 static uint8_t dbg_analog = 0, dbg_port = IOPORT_UNASSIGNED;
 
@@ -240,7 +241,16 @@ static void joy_realtime (sys_state_t state)
     }
 
     int8_t q[3] = {0};
-    bool ok = enable_active() && read_sticks(q);
+    bool valid = read_sticks(q);
+
+    // Start lock: after power-up the joystick stays inactive until all sticks have been seen centered once.
+    if(!armed) {
+        if(!(valid && !q[0] && !q[1] && !q[2]))
+            return;
+        armed = true;
+    }
+
+    bool ok = valid && enable_active();
     bool want = ok && (q[0] || q[1] || q[2]);
 
     if(!want) {
@@ -312,7 +322,7 @@ static void joy_report_options (bool newopt)
 
     if(!newopt) {
         if(ready)
-            snprintf(info, sizeof(info), JOY_VERSION " (enable port %u)", enable_port);
+            snprintf(info, sizeof(info), JOY_VERSION " (enable port %u%s)", enable_port, armed ? "" : ", start lock");
         else
             snprintf(info, sizeof(info), JOY_VERSION " (inactive: analog=%u enable=%u)", dbg_analog, dbg_port);
         report_plugin("Joystick", info);
