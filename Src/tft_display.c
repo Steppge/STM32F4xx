@@ -2441,7 +2441,9 @@ static void tft_realtime (sys_state_t state)
 
     uint32_t t0 = DWT->CYCCNT;
 
-    tft_work(state);
+    // grblHAL passes STATE_ESTOP while blocking on any critical alarm
+    // (e.g. hard limit), use the real state for the display.
+    tft_work(state_get());
 
     uint32_t dt = DWT->CYCCNT - t0;
 
