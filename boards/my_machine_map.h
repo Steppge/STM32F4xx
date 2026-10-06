@@ -1,3 +1,4 @@
+/*
   my_machine_map.h - Board map for BIGTREETECH Octopus Pro v1.0 (F446, 12 MHz)
 
   Based on btt_octopus_pro_map.h (v1.1). Only pins that differ for the
@@ -170,7 +171,7 @@
 #define AUXOUTPUT4_PORT             GPIOA       // Spindle/laser enable - Bed-out (as in Marlin: HEATER_BED_PIN)
 #define AUXOUTPUT4_PIN              1
 
-#define AUXOUTPUT5_PORT             GPIOE       // Spindle direction - FAN5 (NOTE: Marlin lists FAN5 as PD15)
+#define AUXOUTPUT5_PORT             GPIOD       // Spindle direction - FAN5 (PD15 as in Marlin, PE15 is TFT DC on EXP1)
 #define AUXOUTPUT5_PIN              15
 
 #define AUXOUTPUT6_PORT             GPIOA       // Coolant flood - HE0 (v1.0: PA2)
@@ -239,14 +240,17 @@
 #define AUXINPUT4_PIN               3
 #define AUXINPUT5_PORT              GPIOF       // Feed hold - T0
 #define AUXINPUT5_PIN               4
-#define AUXINPUT6_PORT              GPIOF       // Cycle start - T1
-#define AUXINPUT6_PIN               5
+//#define AUXINPUT6_PORT              GPIOF       // Cycle start - T1
+//#define AUXINPUT6_PIN               5
+#define AUXINPUT7_PORT              GPIOG       // Joystick enable (Stop7)
+#define AUXINPUT7_PIN               15
 
-#define AUXINTPUT0_ANALOG_PORT      GPIOF       // T2
-#define AUXINTPUT0_ANALOG_PIN       6
-
-#define AUXINTPUT1_ANALOG_PORT      GPIOF       // T3
-#define AUXINTPUT1_ANALOG_PIN       7
+#define AUXINPUT0_ANALOG_PORT       GPIOF       // TH1 = X stick
+#define AUXINPUT0_ANALOG_PIN        5
+#define AUXINPUT1_ANALOG_PORT       GPIOF       // TH2 = Y stick
+#define AUXINPUT1_ANALOG_PIN        6
+#define AUXINPUT2_ANALOG_PORT       GPIOF       // TH3 = Z stick
+#define AUXINPUT2_ANALOG_PIN        7
 
 // Define user-control controls (cycle start, reset, feed hold) input pins.
 #if CONTROL_ENABLE & CONTROL_HALT
@@ -257,10 +261,10 @@
 #define FEED_HOLD_PORT              AUXINPUT5_PORT
 #define FEED_HOLD_PIN               AUXINPUT5_PIN
 #endif
-#if CONTROL_ENABLE & CONTROL_CYCLE_START
-#define CYCLE_START_PORT            AUXINPUT6_PORT
-#define CYCLE_START_PIN             AUXINPUT6_PIN
-#endif
+//#if CONTROL_ENABLE & CONTROL_CYCLE_START
+//#define CYCLE_START_PORT            AUXINPUT6_PORT
+//#define CYCLE_START_PIN             AUXINPUT6_PIN
+//#endif
 
 #if SAFETY_DOOR_ENABLE
 #define SAFETY_DOOR_PORT            AUXINPUT0_PORT
@@ -274,10 +278,12 @@
 
 #if SDCARD_ENABLE
 #define SDCARD_SDIO                 1
-#ifndef M6_LIMIT_PORT
-#define SD_DETECT_PORT              GPIOC
-#define SD_DETECT_PIN               14
-#endif
+// Card detect disabled: on the Octopus PC14 is high with a card inserted (see Marlin SD_DETECT_STATE HIGH),
+// grblHAL expects low. With it enabled inserting a card unmounts it. The card is mounted on demand instead.
+//#ifndef M6_LIMIT_PORT
+//#define SD_DETECT_PORT              GPIOC
+//#define SD_DETECT_PIN               14
+//#endif
 #endif
 
 //Pins not used

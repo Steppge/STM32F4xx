@@ -23,7 +23,7 @@
 // If none is enabled pin mappings from generic_map.h will be used.
 //#define BOARD_BLACKPILL           // For use with F411 BlackPill, with optional auto square support for one axis
 //#define BOARD_BLACKPILL_ALT2      // For use with F411 BlackPill, with optional auto square support for one axis, I2C and spindle sync
-#define BOARD_BTT_OCTOPUS_PRO     // F446 based 3D Printer board
+//#define BOARD_BTT_OCTOPUS_PRO   // F446 based 3D Printer board
 //#define BOARD_BTT_SKR_20          // F407 based 3D Printer board
 //#define BOARD_BTT_SKR_20_DAC      // F407 based 3D Printer board, uses analog output (DAC) for spindle speed control
 //#define BOARD_BTT_SKR_PRO_1_1     // F407 based 3D Printer board
@@ -46,7 +46,7 @@
 //#define BOARD_PROTONEER_3XX       // For use with Nucleo-F411RE and F446RE boards.
 //#define BOARD_STM32F401_UNI       // F401 CNC board
 //#define BOARD_STM32F407VET6_DEV   // F407 based industrial control board
-//#define BOARD_MY_MACHINE          // Add my_machine_map.h before enabling this!
+#define BOARD_MY_MACHINE          // Add my_machine_map.h before enabling this!
 
 
 // WARNING: BOARD_BTT_SKR_20 may fry your Trinamic drivers due to bad hardware design.
