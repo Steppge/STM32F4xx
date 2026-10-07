@@ -59,6 +59,27 @@ MKS TS35-R V2.0 (ST7796 480x320, XPT2046 touch) on EXP1/EXP2:
 4. Copy `.pio/build/octopus_pro_f446/firmware.bin` as `firmware.bin` to the SD card and power up the board.
 5. Restore the settings from `settings_backup.txt`.
 
+## Troubleshooting: grblHAL on the BTT Octopus Pro
+
+Problems hit while moving this machine from Marlin to grblHAL, with the solutions. Maybe it saves someone else the search.
+
+**No USB / board seems dead after flashing a build with `BOARD_MY_MACHINE` (or a custom board map)**
+- The BTT bootloader leaves the system clock running from the PLL. Upstream grblHAL only switches back to HSI before the PLL setup when `BOARD_BTT_OCTOPUS_PRO` is defined. With any other board define `HAL_RCC_OscConfig()` fails, the firmware ends in `Error_Handler()` and hangs before USB comes up.
+- Fix: the change in `Src/main.c` from this repository, submitted upstream as [grblHAL/STM32F4xx#307](https://github.com/grblHAL/STM32F4xx/pull/307).
+- Workaround without the fix: keep `BOARD_BTT_OCTOPUS_PRO` and put your pins into `boards/btt_octopus_pro_map.h`.
+
+**`my_machine_map.h` only works after renaming it to `btt_octopus_pro_map.h`**
+- Same cause as above, the file name itself does not matter.
+
+**Custom map is silently ignored**
+- `Inc/driver.h` checks `BOARD_BTT_OCTOPUS_PRO` before `BOARD_MY_MACHINE`. If both are defined in `Inc/my_machine.h`, the original BTT map is used. Enable only one board.
+
+**Octopus Pro v1.0 instead of v1.1**
+- The upstream map is for v1.1. Some pins differ on v1.0 (e.g. MOTOR3 enable on PA0, HE0 on PA2, HE2 on PB10, RGB on PB0). The working Marlin configuration (`BOARD_BTT_OCTOPUS_PRO_V1_0`) is a good reference, see the comments in [`boards/my_machine_map.h`](boards/my_machine_map.h).
+
+**Board does not start after flashing from SD card**
+- The firmware must be linked for the 32K bootloader offset. Use the PlatformIO environment `octopus_pro_f446` (`STM32F446ZETX_BL32K_NONVS_FLASH.ld`, `HAS_BOOTLOADER=1`, `HSE_VALUE=12000000`) and copy the file as `firmware.bin` to the SD card.
+
 ## Credits & license
 
 Based on [grblHAL](https://github.com/grblHAL) by Terje Io and contributors – driver [grblHAL/STM32F4xx](https://github.com/grblHAL/STM32F4xx), core [grblHAL/core](https://github.com/grblHAL/core), documentation in the [grblHAL wiki](https://github.com/grblHAL/core/wiki). grblHAL is in turn based on [Grbl](https://github.com/gnea/grbl) by Sungeun K. Jeon and Simen Svale Skogsrud.
