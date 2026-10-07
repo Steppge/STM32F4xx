@@ -40,6 +40,12 @@ MKS TS35-R V2.0 (ST7796 480x320, XPT2046 touch) on EXP1/EXP2:
 - Buttons that move the machine or fire the laser must be held (long press).
 - Anti-aliased fonts and icons, drawn in small steps so the controller is never blocked.
 
+| Main screen (idle) | Main screen (job running) | Menu |
+|---|---|---|
+| ![Main screen idle](media/display/main_idle.png) | ![Main screen job](media/display/main_job.png) | ![Menu](media/display/menu.png) |
+
+*Rendered previews: PC simulation of the display drawing code with the firmware's font data and example values, shown at 2x size.*
+
 ### Settings backup
 [`settings_backup.txt`](settings_backup.txt) holds the `$$` output of the working machine. Send the `$` lines line by line from a sender (e.g. LightBurn) to restore.
 
