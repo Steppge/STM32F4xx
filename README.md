@@ -1,3 +1,62 @@
+# grblHAL for BTT Octopus Pro v1.0 – custom CNC/laser machine
+
+This is a fork of [grblHAL/STM32F4xx](https://github.com/grblHAL/STM32F4xx) with the configuration and extensions for one specific machine: a CNC router/laser built on a **BIGTREETECH Octopus Pro v1.0** (STM32F446ZE, 12 MHz crystal, BTT bootloader), previously running Marlin.
+
+The working branch is **`octopus-pro-joy`** (default branch). `master` tracks upstream grblHAL unchanged.
+
+## What is different from upstream grblHAL
+
+### Own board map via `BOARD_MY_MACHINE`
+- The pin map for this machine is in [`boards/my_machine_map.h`](boards/my_machine_map.h), enabled with `#define BOARD_MY_MACHINE` in [`Inc/my_machine.h`](Inc/my_machine.h).
+- The original [`boards/btt_octopus_pro_map.h`](boards/btt_octopus_pro_map.h) (Octopus Pro v1.1) is **left untouched**, so upstream updates merge without conflicts.
+- Pins differing from the v1.1 map were taken from the working Marlin configuration (`BOARD_BTT_OCTOPUS_PRO_V1_0`) with modified motor slots:
+
+| Axis | Driver slot | Note |
+|---|---|---|
+| X | MOTOR0 | |
+| Y | MOTOR6 | ganged with Y2, auto-squared |
+| Y2 (M3) | MOTOR7 | `Y_GANGED` + `Y_AUTO_SQUARE` |
+| Z | MOTOR1 | |
+| – | MOTOR2 | defective, assigned last (M7) |
+
+- Trinamic TMC2209 drivers via UART, onboard AT24C32 EEPROM, SD card, USB CDC.
+- Spindle/laser: PWM on FAN0 (PA8), enable on the bed output (PA1), direction on FAN5 (PD15). PWM frequency 4000 Hz (`DEFAULT_SPINDLE_PWM_FREQ` in `platformio.ini`).
+- Controls: reset (TB, PF3) and feed hold (T0, PF4), probe on Z2-STOP (PG11).
+
+### Startup fix in `Src/main.c`
+The BTT bootloader leaves the system clock running from the PLL. Upstream only switched back to HSI before the PLL setup for `BOARD_BTT_OCTOPUS_PRO`, so any other board define (e.g. `BOARD_MY_MACHINE`) hung at startup without USB. The switch now depends on the actual clock source instead of the board define. Submitted upstream as [grblHAL/STM32F4xx#307](https://github.com/grblHAL/STM32F4xx/pull/307).
+
+### Analog joystick jogging – [`Src/joystick_plugin.c`](Src/joystick_plugin.c)
+- Three analog sticks on TH1/TH2/TH3 (PF5/PF6/PF7) for X/Y/Z, enable switch on Stop7 (PG15).
+- While the enable switch is active, stick deflection streams short `$J=` jog segments; speed follows the deflection, releasing the stick cancels the jog.
+- Safety: implausible readings (broken wire, short) disable the joystick; after power-up it stays locked until all sticks were centered once (start lock).
+- Raw stick values and the enable level are appended to the status report (`|Joy:x,y,z,en`) for calibration.
+- Stick calibration and speeds are set at the top of the file.
+
+### Touch display – [`Src/tft_display.c`](Src/tft_display.c)
+MKS TS35-R V2.0 (ST7796 480x320, XPT2046 touch) on EXP1/EXP2:
+- Main screen with state, work/machine position, SD job progress, feed rate and WCS; buttons for menu, home, unlock, zeroing, hold and start.
+- Menu with zeroing, Z probing (sets Z0 with plate thickness), laser test pulse, SD card file list and touch calibration.
+- Buttons that move the machine or fire the laser must be held (long press).
+- Anti-aliased fonts and icons, drawn in small steps so the controller is never blocked.
+
+### Settings backup
+[`settings_backup.txt`](settings_backup.txt) holds the `$$` output of the working machine. Send the `$` lines line by line from a sender (e.g. LightBurn) to restore.
+
+## Build and flash
+1. Install VS Code with the PlatformIO extension.
+2. Clone **with submodules**:
+   ```
+   git clone --recursive -b octopus-pro-joy https://github.com/Steppge/grblHAL-OctopusPro-CNC-Laser.git
+   ```
+3. Build the environment **`octopus_pro_f446`** (linker script `STM32F446ZETX_BL32K_NONVS_FLASH.ld`, 32K bootloader offset).
+4. Copy `.pio/build/octopus_pro_f446/firmware.bin` as `firmware.bin` to the SD card and power up the board.
+5. Restore the settings from `settings_backup.txt`.
+
+---
+
+*Original upstream README below.*
+
 # STM32F4xx grblHAL driver
 
 A grblHAL driver for the STM32F401xC, STM32F407xx, STM32F411xE and STM32F446xx ARM processors.
