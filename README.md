@@ -9,7 +9,7 @@ The working branch is **`octopus-pro-joy`** (default branch). `master` tracks up
 ### Own board map via `BOARD_MY_MACHINE`
 - The pin map for this machine is in [`boards/my_machine_map.h`](boards/my_machine_map.h), enabled with `#define BOARD_MY_MACHINE` in [`Inc/my_machine.h`](Inc/my_machine.h).
 - The original [`boards/btt_octopus_pro_map.h`](boards/btt_octopus_pro_map.h) (Octopus Pro v1.1) is **left untouched**, so upstream updates merge without conflicts.
-- Pins differing from the v1.1 map were taken from the working Marlin configuration (`BOARD_BTT_OCTOPUS_PRO_V1_0`) with modified motor slots:
+- Pins differing from the v1.1 map were taken from the working Marlin configuration ([Steppge/Marlin-OctopusPro-CNC-Laser](https://github.com/Steppge/Marlin-OctopusPro-CNC-Laser), `BOARD_BTT_OCTOPUS_PRO_V1_0`) with modified motor slots:
 
 | Axis | Driver slot | Note |
 |---|---|---|
