@@ -17,7 +17,7 @@ The working branch is **`octopus-pro-joy`** (default branch). `master` tracks up
 | Y | MOTOR6 | ganged with Y2, auto-squared |
 | Y2 (M3) | MOTOR7 | `Y_GANGED` + `Y_AUTO_SQUARE` |
 | Z | MOTOR1 | |
-| – | MOTOR2 | defective, assigned last (M7) |
+| – | MOTOR2 | spare (M7), its stepper driver was damaged – the slot itself is fine and usable with a new driver |
 
 - Trinamic TMC2209 drivers via UART, onboard AT24C32 EEPROM, SD card, USB CDC.
 - Spindle/laser: PWM on FAN0 (PA8), enable on the bed output (PA1), direction on FAN5 (PD15). PWM frequency 4000 Hz (`DEFAULT_SPINDLE_PWM_FREQ` in `platformio.ini`).

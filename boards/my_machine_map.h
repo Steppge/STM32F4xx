@@ -56,7 +56,7 @@
 // MOTOR3 -> M4 (spare)
 // MOTOR4 -> M5 (spare)
 // MOTOR5 -> M6 (spare)
-// MOTOR2 -> M7 (spare, defective)
+// MOTOR2 -> M7 (spare, stepper driver was damaged - slot is OK with a new driver)
 
 // Define step pulse output pins.
 #define X_STEP_PORT                 GPIOF
@@ -145,7 +145,7 @@
 #endif
 
 #if N_ABC_MOTORS > 4
-#define M7_AVAILABLE                            // MOTOR2 (defective)
+#define M7_AVAILABLE                            // MOTOR2 (spare, needs a new stepper driver)
 #define M7_STEP_PORT                GPIOF
 #define M7_STEP_PIN                 11
 #define M7_DIRECTION_PORT           GPIOG
