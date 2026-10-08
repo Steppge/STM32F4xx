@@ -1,7 +1,7 @@
 /*
   joystick_plugin.c - analog joystick jogging for grblHAL (STM32F4xx, BTT Octopus Pro)
 
-  PROTOTYPE v0.3 - tested only in short bench runs. Keep a hand on the power switch.
+  PROTOTYPE v0.5 - tested only in short bench runs. Keep a hand on the power switch.
 
   Reads three analog inputs (X, Y, Z stick) plus one digital enable input (PG15).
   While the enable switch is held and a stick is out of its dead zone, the plugin
@@ -23,11 +23,20 @@
      full speed motion and slowing down the stick had (almost) no effect.
    - segment length is at least the braking distance (from $120-$122), so the motion
      stays smooth with the short queue.
+
+  Changes in v0.4:
+   - start lock: after power-up the joystick stays inactive until all sticks were centered once.
+
+  Changes in v0.5:
+   - JOY_STEPS speed steps per direction with hysteresis, readings are smoothed, smaller dead zone.
+   - step 1 has a fixed slow speed (JOY_FEED_MIN_*) for touching off, steps 2..JOY_STEPS
+     rise up to JOY_MAX_RATE_PCT of the axis max rate ($110-$112).
 */
 
 #include "driver.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -39,7 +48,7 @@
 #include "grbl/planner.h"
 #include "grbl/settings.h"
 
-#define JOY_VERSION "0.4"
+#define JOY_VERSION "0.5"
 
 // ------------------------------------------------------------------------
 // Configuration - adjust to your sticks
@@ -61,19 +70,23 @@ typedef struct {
 // 12 bit ADC readings (0..4095), measured on this machine.
 // Direction: raw above center = positive jog.
 static const joy_axis_cfg_t joy_cfg[3] = {
-    {  590, 1484, 1957, 60, false },    // X  (right 590, rest ~1484, left 1957)
-    {  687, 1445, 1942, 60, false },    // Y
-    {  693, 1534, 2035, 60, false }     // Z
+    {  590, 1484, 1957, 30, false },    // X  (right 590, rest ~1484, left 1957)
+    {  687, 1445, 1942, 30, false },    // Y
+    {  693, 1534, 2035, 30, false }     // Z
 };
 
 // Readings outside this window are treated as a fault (broken wire reads ~4095, short ~0).
 #define JOY_ADC_VALID_MIN   250
 #define JOY_ADC_VALID_MAX  2600
 
-#define JOY_FEED_XY       1500.0f   // mm/min at full deflection (start low!)
-#define JOY_FEED_Z         500.0f   // mm/min at full deflection
+#define JOY_FEED_MIN_XY      5.0f   // mm/min at step 1 (fixed, for touching off)
+#define JOY_FEED_MIN_Z       2.0f   // mm/min at step 1 (fixed, for touching off)
+#define JOY_MAX_RATE_PCT    35.0f   // top step in % of the axis max rate ($110-$112)
 
-#define JOY_LEVELS            20    // speed is quantised to 1/JOY_LEVELS steps
+#define JOY_STEPS             10    // speed steps per direction
+#define JOY_HYST            0.03f   // hysteresis between steps, fraction of the full stick travel
+#define JOY_DZ_HYST           10    // ADC counts: a running stick stops only this far inside the dead zone
+#define JOY_FILTER             4    // smoothing, new reading weight 1/JOY_FILTER
 #define JOY_POLL_MS           20    // stick sampling interval
 #define JOY_SEG_TIME_S      0.10f   // travel time covered by one jog segment (seconds), lower = faster response
 #define JOY_MAX_QUEUED         2    // max. planner blocks (incl. the running one) before a new segment is sent
@@ -109,10 +122,15 @@ static bool cancel_sent = false;
 static int8_t sent_sign[3] = {0};   // direction pattern of the running jog
 static uint32_t last_poll = 0;
 
-static float normalize (int32_t raw, const joy_axis_cfg_t *c)
+static int8_t step[3] = {0};         // current speed step per axis, signed
+static int32_t filt[3];             // smoothed readings, ADC counts * 16
+static bool filt_init = false;
+
+// Stick deflection -1..1 outside the dead zone, 0 inside.
+static float normalize (int32_t raw, const joy_axis_cfg_t *c, int32_t deadzone)
 {
     float v = 0.0f;
-    int32_t lo = c->center - c->deadzone, hi = c->center + c->deadzone;
+    int32_t lo = c->center - deadzone, hi = c->center + deadzone;
 
     if(raw < lo)
         v = -(float)(lo - raw) / (float)(lo - c->min);
@@ -124,27 +142,87 @@ static float normalize (int32_t raw, const joy_axis_cfg_t *c)
     else if(v < -1.0f)
         v = -1.0f;
 
-    v = v * fabsf(v); // quadratic response for finer control near center
-
     return c->invert ? -v : v;
 }
 
-// Returns false on a fault (implausible reading). q[] gets the quantised deflection per axis.
+// New speed step from the deflection, a step only changes when the stick is moved
+// JOY_HYST beyond the step boundary, so ADC noise does not toggle the speed.
+static int8_t update_step (int8_t cur, float d)
+{
+    if(d == 0.0f)
+        return 0;
+
+    int8_t target = (int8_t)ceilf(fabsf(d) * JOY_STEPS);
+    if(target > JOY_STEPS)
+        target = JOY_STEPS;
+    if(d < 0.0f)
+        target = -target;
+
+    if(cur == 0 || (cur > 0) != (target > 0) || target == cur)
+        return target;
+
+    float a = fabsf(d), n = (float)abs(cur);
+
+    if(abs(target) > abs(cur))
+        return a > n / JOY_STEPS + JOY_HYST ? target : cur;
+
+    return a <= (n - 1.0f) / JOY_STEPS - JOY_HYST ? target : cur;
+}
+
+// Returns false on a fault (implausible reading). q[] gets the speed step per axis.
 static bool read_sticks (int8_t q[3])
 {
     static const uint8_t port[3] = { JOY_PORT_X, JOY_PORT_Y, JOY_PORT_Z };
+    int32_t raw[3];
 
     for(uint_fast8_t i = 0; i < 3; i++) {
 
-        int32_t raw = ioport_wait_on_input(Port_Analog, port[i], WaitMode_Immediate, 0.0f);
+        raw[i] = ioport_wait_on_input(Port_Analog, port[i], WaitMode_Immediate, 0.0f);
 
-        if(raw < JOY_ADC_VALID_MIN || raw > JOY_ADC_VALID_MAX)
+        if(raw[i] < JOY_ADC_VALID_MIN || raw[i] > JOY_ADC_VALID_MAX) {
+            filt_init = false;
+            memset(step, 0, sizeof(step));
             return false;
-
-        q[i] = (int8_t)lroundf(normalize(raw, &joy_cfg[i]) * JOY_LEVELS);
+        }
     }
 
+    for(uint_fast8_t i = 0; i < 3; i++) {
+
+        if(!filt_init)
+            filt[i] = raw[i] * 16;
+        else
+            filt[i] += (raw[i] * 16 - filt[i]) / JOY_FILTER;
+
+        // A running axis keeps moving until the stick is JOY_DZ_HYST counts inside the dead zone.
+        int32_t dz = joy_cfg[i].deadzone - (step[i] ? JOY_DZ_HYST : 0);
+
+        step[i] = update_step(step[i], normalize((filt[i] + 8) / 16, &joy_cfg[i], dz));
+        q[i] = step[i];
+    }
+
+    filt_init = true;
+
     return true;
+}
+
+// Axis speed in mm/min for a speed step: step 1 is fixed, steps 2..JOY_STEPS rise
+// quadratically from there to JOY_MAX_RATE_PCT of the axis max rate.
+static float step_feed (uint_fast8_t axis, int8_t q)
+{
+    uint_fast8_t n = (uint_fast8_t)abs(q);
+
+    if(n == 0)
+        return 0.0f;
+
+    float min = axis == Z_AXIS ? JOY_FEED_MIN_Z : JOY_FEED_MIN_XY;
+    float max = settings.axis[axis].max_rate * JOY_MAX_RATE_PCT / 100.0f;
+
+    if(max < min)
+        max = min;
+
+    float f = (float)(n - 1) / (float)(JOY_STEPS - 1);
+
+    return min + (max - min) * f * f;
 }
 
 static bool enable_active (void)
@@ -178,14 +256,12 @@ static void send_segment (const int8_t q[3])
 {
     static const char axis[3] = { 'X', 'Y', 'Z' };
 
-    float s[3] = {
-        (float)q[0] * JOY_FEED_XY / JOY_LEVELS,
-        (float)q[1] * JOY_FEED_XY / JOY_LEVELS,
-        (float)q[2] * JOY_FEED_Z / JOY_LEVELS
-    };
+    float s[3];
+    for(uint_fast8_t i = 0; i < 3; i++)
+        s[i] = q[i] < 0 ? -step_feed(i, q[i]) : step_feed(i, q[i]);
     float feed = sqrtf(s[0] * s[0] + s[1] * s[1] + s[2] * s[2]);
 
-    if(feed < 1.0f)
+    if(feed < 0.5f)
         return;
 
     float dist = feed / 60.0f * JOY_SEG_TIME_S; // total path length of the segment, mm
@@ -209,10 +285,10 @@ static void send_segment (const int8_t q[3])
 
     for(uint_fast8_t i = 0; i < 3; i++) {
         if(q[i])
-            p += snprintf(p, sizeof(cmd) - (size_t)(p - cmd), "%c%.3f", axis[i], dist * s[i] / feed);
+            p += snprintf(p, sizeof(cmd) - (size_t)(p - cmd), "%c%.4f", axis[i], dist * s[i] / feed);
     }
 
-    snprintf(p, sizeof(cmd) - (size_t)(p - cmd), "F%.0f", feed);
+    snprintf(p, sizeof(cmd) - (size_t)(p - cmd), "F%.1f", feed);
 
     if(grbl.enqueue_gcode(cmd)) {
         for(uint_fast8_t i = 0; i < 3; i++)
