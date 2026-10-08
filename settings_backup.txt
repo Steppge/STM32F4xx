@@ -1,5 +1,6 @@
 ; grblHAL settings backup - BTT Octopus Pro V1.0 (F446), 2026-10-05
 ; Firmware: commit e4068f9 (display v0.2, joystick v0.3, SD card)
+; 2026-10-08: $21=3 (hard limits + strict mode: no motion except homing while a limit switch is engaged)
 ; Restore: send the $ lines below line by line from the console (LightBurn or other sender).
 $0=5.0
 $1=25
@@ -21,7 +22,7 @@ $17=0
 $18=0
 $19=0
 $20=1
-$21=1
+$21=3
 $22=523
 $23=3
 $26=25

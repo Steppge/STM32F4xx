@@ -36,7 +36,7 @@ The BTT bootloader leaves the system clock running from the PLL. Upstream only s
 
 ### Touch display – [`Src/tft_display.c`](Src/tft_display.c)
 MKS TS35-R V2.0 (ST7796 480x320, XPT2046 touch) on EXP1/EXP2:
-- Main screen with state, work/machine position, SD job progress, feed rate and WCS; buttons for menu, home, unlock, zeroing, hold and start. The start button shows LOAD while no file is selected.
+- Main screen with state, work/machine position, SD job progress, feed rate and WCS; buttons for menu, home, unlock, zeroing, hold and start. The start button shows LOAD while no file is selected. The unlock button shows RESET while a hard limit alarm waits for a reset and is greyed out while a limit switch is engaged (strict mode).
 - Menu with zeroing, Z probing (sets Z0 with plate thickness), laser test pulse, SD card file list, settings, machine mode and a Move screen.
 - Move screen: jog X/Y/Z by tapping, step 0.001 / 0.01 / 0.1 / 1 / 10 mm per tap.
 - Touch calibration: hold the status bar on the main screen for 3 seconds while idle.
@@ -79,6 +79,10 @@ Problems hit while moving this machine from Marlin to grblHAL, with the solution
 
 **Octopus Pro v1.0 instead of v1.1**
 - The upstream map is for v1.1. Some pins differ on v1.0 (e.g. MOTOR3 enable on PA0, HE0 on PA2, HE2 on PB10, RGB on PB0). The working Marlin configuration (`BOARD_BTT_OCTOPUS_PRO_V1_0`) is a good reference, see the comments in [`boards/my_machine_map.h`](boards/my_machine_map.h).
+
+**Axis drives through an engaged limit switch into the mechanical stop**
+- Hard limits only trigger on the change from released to engaged. A sender like LightBurn sends a reset right after `ALARM:1`; when the machine was standing still the position is not lost and grblHAL returns to Idle while the switch is still engaged. The next move towards the switch then gets no new trigger.
+- Fix: `$21=3` (hard limits + strict mode). With a limit switch engaged after a reset grblHAL raises `ALARM:12`, refuses `$X` and only allows homing. Soft limits (`$20=1`) protect both ends once the machine is homed.
 
 **Board does not start after flashing from SD card**
 - The firmware must be linked for the 32K bootloader offset. Use the PlatformIO environment `octopus_pro_f446` (`STM32F446ZETX_BL32K_NONVS_FLASH.ld`, `HAS_BOOTLOADER=1`, `HSE_VALUE=12000000`) and copy the file as `firmware.bin` to the SD card.
