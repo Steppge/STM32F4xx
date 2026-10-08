@@ -51,13 +51,18 @@ MKS TS35-R V2.0 (ST7796 480x320, XPT2046 touch) on EXP1/EXP2:
 
 ## Build and flash
 1. Install VS Code with the PlatformIO extension.
-2. Clone **with submodules**:
+2. Clone **with submodules** ("Download ZIP" on GitHub does not include them, the build fails):
    ```
    git clone --recursive -b octopus-pro-joy https://github.com/Steppge/grblHAL-OctopusPro-CNC-Laser.git
    ```
-3. Build the environment **`octopus_pro_f446`** (linker script `STM32F446ZETX_BL32K_NONVS_FLASH.ld`, 32K bootloader offset).
-4. Copy `.pio/build/octopus_pro_f446/firmware.bin` as `firmware.bin` to the SD card and power up the board.
-5. Restore the settings from `settings_backup.txt`.
+3. Select the board in [`Inc/my_machine.h`](Inc/my_machine.h), enable **only one** of them:
+   - `#define BOARD_MY_MACHINE` – pin map [`boards/my_machine_map.h`](boards/my_machine_map.h) (this machine's wiring, active by default)
+   - `#define BOARD_BTT_OCTOPUS_PRO` – original grblHAL pin map for the Octopus Pro (v1.1)
+
+   Also check the other options in `my_machine.h` (motor currents, ganged Y axis, laser, ...). If you don't have the joystick and display, remove `-D ADD_MY_PLUGIN=1` from the `octopus_pro_f446` environment in `platformio.ini`.
+4. Build the environment **`octopus_pro_f446`** (linker script `STM32F446ZETX_BL32K_NONVS_FLASH.ld`, 32K bootloader offset).
+5. Copy `.pio/build/octopus_pro_f446/firmware.bin` as `firmware.bin` to the SD card and power up the board.
+6. Restore the settings from `settings_backup.txt`.
 
 ## Troubleshooting: grblHAL on the BTT Octopus Pro
 
