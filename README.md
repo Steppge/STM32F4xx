@@ -19,7 +19,7 @@ The working branch is **`octopus-pro-joy`** (default branch). `master` tracks up
 | Z | MOTOR1 | |
 | – | MOTOR2 | spare (M7), no driver fitted |
 
-- Trinamic TMC2209 drivers via UART, onboard AT24C32 EEPROM, SD card, USB CDC.
+- Trinamic TMC2209 drivers via UART, onboard AT24C32 EEPROM, SD card with YModem upload over USB (`SDCARD_ENABLE 2`, e.g. with ioSender), USB CDC.
 - Spindle/laser: PWM on FAN0 (PA8), enable on the bed output (PA1), direction on FAN5 (PD15). PWM frequency 4000 Hz (`DEFAULT_SPINDLE_PWM_FREQ` in `platformio.ini`).
 - Controls: reset (TB, PF3) and feed hold (T0, PF4), probe on Z2-STOP (PG11).
 
