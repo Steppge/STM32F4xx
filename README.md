@@ -62,7 +62,6 @@ MKS TS35-R V2.0 (ST7796 480x320, XPT2046 touch) on EXP1/EXP2:
    Also check the other options in `my_machine.h` (motor currents, ganged Y axis, laser, ...). If you don't have the joystick and display, remove `-D ADD_MY_PLUGIN=1` from the `octopus_pro_f446` environment in `platformio.ini`.
 4. Build the environment **`octopus_pro_f446`** (linker script `STM32F446ZETX_BL32K_NONVS_FLASH.ld`, 32K bootloader offset).
 5. Copy `.pio/build/octopus_pro_f446/firmware.bin` as `firmware.bin` to the SD card and power up the board.
-6. Restore the settings from `settings_backup.txt`.
 
 ## Troubleshooting: grblHAL on the BTT Octopus Pro
 
