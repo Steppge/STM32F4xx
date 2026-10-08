@@ -15,6 +15,7 @@
   Screens:
     Main   state, work position (large), machine position or SD job progress, feed rate, WCS.
            MENU, HOME, UNLOCK, X0 Y0, Z0, HOLD, START.
+           UNLOCK shows RESET while a critical alarm (e.g. hard limit) waits for a reset.
            START resumes after HOLD/M0/tool change. When idle it opens the SD card list,
            or runs the selected file (hold). While no file is selected it is labelled LOAD.
     Menu   X=0, Y=0, Z=0, XYZ=0, PROBE Z, LASER, SD CARD, SETTINGS, MOVE, MODE
@@ -1895,7 +1896,21 @@ static void refresh_values (sys_state_t state)
         button_t *b = &buttons[i];
         switch(b->action) {
             case A_Home:      button_set_enabled(b, idle || (state & STATE_ALARM)); break;
-            case A_Unlock:    button_set_enabled(b, !!(state & STATE_ALARM)); break;
+            case A_Unlock:
+                {
+                    // RESET while a critical alarm (hard limit, e-stop) waits for a reset, UNLOCK otherwise
+                    const char *label = sys.blocking_event ? "RESET" : "UNLOCK";
+                    if(strcmp(b->label, label)) {
+                        b->label = label;
+                        b->icon = sys.blocking_event ? ICON_ALERT : ICON_UNLOCK;
+                        b->dirty = true;
+                    }
+                    // in strict mode ($21 bit 1) $X is refused while a limit switch is engaged, only homing helps
+                    bool engaged = !sys.blocking_event && settings.limits.flags.hard_enabled && settings.limits.flags.check_at_init &&
+                                    (limit_signals_merge(hal.limits.get_state()).value & sys.hard_limits.mask);
+                    button_set_enabled(b, !!(state & (STATE_ALARM|STATE_ESTOP)) && !engaged);
+                }
+                break;
             case A_ZeroXY:
             case A_ZeroZ:
             case A_ZeroX:
@@ -2134,7 +2149,12 @@ static void action_run (button_t *b)
         case A_JogZp:     move_jog(Z_AXIS, 1.0f); break;
 
         case A_Home:      enqueue("$H"); break;
-        case A_Unlock:    enqueue("$X"); break;
+        case A_Unlock:
+            if(sys.blocking_event)
+                grbl.enqueue_realtime_command(CMD_RESET);
+            else
+                enqueue("$X");
+            break;
         case A_ZeroXY:    enqueue("G10L20P0X0Y0"); break;
         case A_ZeroZ:     enqueue("G10L20P0Z0"); break;
         case A_ZeroX:     enqueue("G10L20P0X0"); break;
