@@ -28,15 +28,18 @@ The BTT bootloader leaves the system clock running from the PLL. Upstream only s
 
 ### Analog joystick jogging – [`Src/joystick_plugin.c`](Src/joystick_plugin.c)
 - Three analog sticks on TH1/TH2/TH3 (PF5/PF6/PF7) for X/Y/Z, enable switch on Stop7 (PG15).
-- While the enable switch is active, stick deflection streams short `$J=` jog segments; speed follows the deflection, releasing the stick cancels the jog.
+- While the enable switch is active, stick deflection streams short `$J=` jog segments; releasing the stick cancels the jog.
+- 10 speed steps per direction with hysteresis and smoothed readings. Step 1 has a fixed slow speed (5 mm/min X/Y, 2 mm/min Z) for touching off, steps 2-10 rise up to 35 % of the axis max rate (`$110`-`$112`).
 - Safety: implausible readings (broken wire, short) disable the joystick; after power-up it stays locked until all sticks were centered once (start lock).
 - Raw stick values and the enable level are appended to the status report (`|Joy:x,y,z,en`) for calibration.
 - Stick calibration and speeds are set at the top of the file.
 
 ### Touch display – [`Src/tft_display.c`](Src/tft_display.c)
 MKS TS35-R V2.0 (ST7796 480x320, XPT2046 touch) on EXP1/EXP2:
-- Main screen with state, work/machine position, SD job progress, feed rate and WCS; buttons for menu, home, unlock, zeroing, hold and start.
-- Menu with zeroing, Z probing (sets Z0 with plate thickness), laser test pulse, SD card file list and touch calibration.
+- Main screen with state, work/machine position, SD job progress, feed rate and WCS; buttons for menu, home, unlock, zeroing, hold and start. The start button shows LOAD while no file is selected.
+- Menu with zeroing, Z probing (sets Z0 with plate thickness), laser test pulse, SD card file list, settings, machine mode and a Move screen.
+- Move screen: jog X/Y/Z by tapping, step 0.001 / 0.01 / 0.1 / 1 / 10 mm per tap.
+- Touch calibration: hold the status bar on the main screen for 3 seconds while idle.
 - Buttons that move the machine or fire the laser must be held (long press).
 - Anti-aliased fonts and icons, drawn in small steps so the controller is never blocked.
 
