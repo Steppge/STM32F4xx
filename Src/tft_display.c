@@ -16,14 +16,16 @@
     Main   state, work position (large), machine position or SD job progress, feed rate, WCS.
            MENU, HOME, UNLOCK, X0 Y0, Z0, HOLD, START.
            START resumes after HOLD/M0/tool change. When idle it opens the SD card list,
-           or runs the selected file (hold).
-    Menu   X=0, Y=0, Z=0, XYZ=0, PROBE Z, LASER, SD CARD, TOUCH CAL
+           or runs the selected file (hold). While no file is selected it is labelled LOAD.
+    Menu   X=0, Y=0, Z=0, XYZ=0, PROBE Z, LASER, SD CARD, SETTINGS, MOVE, MODE
+    Move   jog X/Y/Z by tapping, step 0.001, 0.01, 0.1, 1 or 10 mm per tap
     Laser  test pulse with adjustable power and duration
     Probe  probe Z with the probe input, sets Z0 (plus plate thickness) and retracts
     SD     file list of the SD card root folder, select and run
 
   Buttons that move the machine, change offsets or fire the laser must be held for
   TFT_LONG_PRESS_MS (yellow while held, green when triggered). HOLD acts on touch.
+  Exception: the jog buttons on the Move screen act on a tap (one step per tap).
 
   Drawing is done in small steps from the realtime loop (one glyph, button or screen band
   per call) so the controller is never blocked for more than a few milliseconds.
@@ -87,6 +89,7 @@
 
 #define TFT_LONG_PRESS_MS        600    // buttons that move the machine or change offsets need a press this long
 #define TFT_CAL_HOLD_MS         3000    // hold the status bar this long to recalibrate touch
+#define TFT_MOVE_RATE_PCT         30    // Move screen: jog feed rate in % of the axis max rate ($110-$112)
 #define TFT_REFRESH_MS           100    // values are read this often
 #define TFT_REFRESH_RUN_MS       200    // ... and this often while a job is running, leaves more time for the planner
 #define TOUCH_POLL_MS             20
@@ -172,7 +175,8 @@ typedef enum {
     Scr_Sd,
     Scr_SetGroups,
     Scr_SetList,
-    Scr_SetEdit
+    Scr_SetEdit,
+    Scr_Move
 } screen_t;
 
 typedef enum {
@@ -186,6 +190,8 @@ typedef enum {
     A_Key0, A_Key1, A_Key2, A_Key3, A_Key4, A_Key5, A_Key6, A_Key7, A_Key8, A_Key9,
     A_KeyDot, A_KeyMinus, A_KeyDel, A_KeyClr, A_KeyNow, A_Save,
     A_Mode,
+    A_ScrMove, A_JogXm, A_JogXp, A_JogYm, A_JogYp, A_JogZm, A_JogZp,
+    A_Step0, A_Step1, A_Step2, A_Step3, A_Step4,   // A_Step0 + index into move_step_val[]
     A_Row0      // A_Row0 + row
 } action_t;
 
@@ -285,6 +291,9 @@ typedef enum {
 static const uint8_t laser_pwr_val[] = { 1, 2, 3, 5, 10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 90, 100 };
 static const uint16_t laser_time_val[] = { 10, 20, 50, 100, 200, 500, 1000, 2000 };
 static const uint16_t probe_feed_val[] = { 25, 50, 100, 150, 200, 300 };
+static const float move_step_val[] = { 0.001f, 0.01f, 0.1f, 1.0f, 10.0f };
+static const char *const move_step_label[] = { "0.001", "0.01", "0.1", "1", "10" };
+static uint8_t move_step = 3;   // index into move_step_val[], default 1 mm
 
 #define N_VAL(a) (sizeof(a) / sizeof(a[0]))
 
@@ -295,7 +304,7 @@ enum {
     F_State = 0, F_Feed, F_Wcs, F_X, F_Y, F_Z, F_Info, F_Mode, F_MX, F_MY, F_MZ, F_Pct  // main screen
 };
 enum {
-    F_Pos = 0                                           // menu screen
+    F_Pos = 0                                           // menu and move screens
 };
 enum {
     F_Val1 = 0, F_Val2, F_Msg                           // laser and probe screens
@@ -1151,6 +1160,17 @@ static bool enqueue (const char *cmd)
     return grbl.enqueue_gcode(buf);
 }
 
+// Move screen: jog one step of the selected size along an axis.
+static void move_jog (uint_fast8_t axis, float dir)
+{
+    static const char name[3] = { 'X', 'Y', 'Z' };
+    char cmd[48];
+
+    snprintf(cmd, sizeof(cmd), "$J=G91G21%c%.3fF%.0f", name[axis], dir * move_step_val[move_step],
+              settings.axis[axis].max_rate * TFT_MOVE_RATE_PCT / 100.0f);
+    enqueue(cmd);
+}
+
 static void laser_stop (void)
 {
     spindle_ptrs_t *sp = spindle_get(0);
@@ -1564,6 +1584,12 @@ static const static_item_t menu_statics[] = {
     { 112, (BAR_H - 16) / 2, 0, 0, NULL, 0, "MENU", C_WHITE, &aa_state }     // aa_state height 16
 };
 
+static const static_item_t move_statics[] = {
+    { 0, BAR_H, TFT_WIDTH, 2, NULL, 0, NULL, C_DGREY },
+    { 112, (BAR_H - 16) / 2, 0, 0, NULL, 0, "MOVE", C_WHITE, &aa_state },    // aa_state height 16
+    { 220, (BAR_H - 16) / 2, 0, 0, NULL, 0, "MM PER TAP BELOW", C_GREY, &aa_state }
+};
+
 static const static_item_t laser_statics[] = {
     { 0, BAR_H, TFT_WIDTH, 2, NULL, 0, NULL, C_DGREY },
     { 112, 10, 0, 0, &font_m, 1, "LASER TEST", C_WHITE },
@@ -1675,9 +1701,23 @@ static void screen_build (screen_t scr)
             }
             button_add(320, 158, 160, 78, "SD CARD", A_ScrSd, Fire_OnRelease)->icon = ICON_SD_CARD;
             button_add(0,   236, 160, 78, "SETTINGS", A_ScrSettings, Fire_OnRelease)->icon = ICON_SETTINGS;
-            button_add(160, 236, 160, 78, "TOUCH CAL", A_TouchCal, Fire_LongPress)->icon = ICON_TOUCH;
+            button_add(160, 236, 160, 78, "MOVE", A_ScrMove, Fire_OnRelease)->icon = ICON_CROSSHAIR;
             button_add(320, 236, 160, 78, mode_label(), A_Mode, Fire_LongPress)->icon = ICON_MODE;
             mode_shown = settings.mode;
+            break;
+
+        case Scr_Move:
+            STATICS(move_statics);
+            field_add_aa(10, 50, &aa_label, 38, TFT_WIDTH - 20, Align_Left, C_GREY, C_BLACK);                      // F_Pos
+            button_add(0, 0, 96, BAR_H, "BACK", A_Back, Fire_OnRelease);
+            button_add(90,  76, 90, 61, "Y+", A_JogYp, Fire_OnRelease);
+            button_add(0,  137, 90, 61, "X-", A_JogXm, Fire_OnRelease);
+            button_add(180, 137, 90, 61, "X+", A_JogXp, Fire_OnRelease);
+            button_add(90, 198, 90, 61, "Y-", A_JogYm, Fire_OnRelease);
+            button_add(290, 76, 190, 91, "Z+", A_JogZp, Fire_OnRelease);
+            button_add(290, 167, 190, 92, "Z-", A_JogZm, Fire_OnRelease);
+            for(uint_fast8_t i = 0; i < N_VAL(move_step_val); i++)
+                button_add(i * (TFT_WIDTH / 5), 262, TFT_WIDTH / 5, 58, move_step_label[i], (action_t)(A_Step0 + i), Fire_OnRelease);
             break;
 
         case Scr_Laser:
@@ -1865,6 +1905,16 @@ static void refresh_values (sys_state_t state)
             case A_ScrSd:     button_set_enabled(b, idle); break;
             case A_Hold:      button_set_enabled(b, !!(state & (STATE_CYCLE|STATE_JOG))); break;
             case A_Start:
+                {
+                    // LOAD while no file is selected (tap opens the file list), START otherwise
+                    bool load = !(state & (STATE_HOLD|STATE_TOOL_CHANGE)) && !*sd_path;
+                    const char *label = load ? "LOAD" : "START";
+                    if(strcmp(b->label, label)) {
+                        b->label = label;
+                        b->icon = load ? ICON_SD_CARD : ICON_PLAY;
+                        b->dirty = true;
+                    }
+                }
                 if(state & (STATE_HOLD|STATE_TOOL_CHANGE)) {
                     b->fire = Fire_OnRelease;       // resume
                     button_set_enabled(b, true);
@@ -1875,6 +1925,26 @@ static void refresh_values (sys_state_t state)
                 }
                 break;
             case A_Fire:      button_set_enabled(b, idle && !laser_active && !spindle_is_on()); break;
+            case A_JogXm:
+            case A_JogXp:
+            case A_JogYm:
+            case A_JogYp:
+            case A_JogZm:
+            case A_JogZp:     button_set_enabled(b, idle || !!(state & STATE_JOG)); break;
+            case A_Step0:
+            case A_Step1:
+            case A_Step2:
+            case A_Step3:
+            case A_Step4:
+                {   // selected step size is shown green
+                    style_t style = b->action - A_Step0 == move_step ? Style_Go : Style_Normal;
+                    if(b->style != style) {
+                        b->style = style;
+                        b->dirty = true;
+                    }
+                    button_set_enabled(b, true);
+                }
+                break;
             case A_Mode:
                 button_set_enabled(b, idle && !spindle_is_on());
                 if(mode_shown != settings.mode) {   // label follows $32, also when changed elsewhere
@@ -1953,6 +2023,7 @@ static void refresh_values (sys_state_t state)
             break;
 
         case Scr_Menu:
+        case Scr_Move:
             snprintf(buf, sizeof(buf), "X %.3f     Y %.3f     Z %.3f", wpos[0], wpos[1], wpos[2]);
             field_set(F_Pos, buf);
             break;
@@ -2037,6 +2108,7 @@ static void action_run (button_t *b)
         case A_Back:
             switch(screen) {
                 case Scr_Menu:      screen_switch(Scr_Main); break;
+                case Scr_Move:      screen_switch(Scr_Menu); break;
                 case Scr_Sd:        screen_switch(sd_back); break;
                 case Scr_SetList:   list_keep = true; screen_switch(Scr_SetGroups); break;
                 case Scr_SetEdit:   list_keep = true; screen_switch(Scr_SetList); break;
@@ -2053,6 +2125,13 @@ static void action_run (button_t *b)
             enqueue(settings.mode == Mode_Laser ? "$32=0" : "$32=1");
             break;
         case A_TouchCal:  phase = Tft_CalStart; phase_wait = 0; break;
+        case A_ScrMove:   screen_switch(Scr_Move); break;
+        case A_JogXm:     move_jog(X_AXIS, -1.0f); break;
+        case A_JogXp:     move_jog(X_AXIS, 1.0f); break;
+        case A_JogYm:     move_jog(Y_AXIS, -1.0f); break;
+        case A_JogYp:     move_jog(Y_AXIS, 1.0f); break;
+        case A_JogZm:     move_jog(Z_AXIS, -1.0f); break;
+        case A_JogZp:     move_jog(Z_AXIS, 1.0f); break;
 
         case A_Home:      enqueue("$H"); break;
         case A_Unlock:    enqueue("$X"); break;
@@ -2137,6 +2216,10 @@ static void action_run (button_t *b)
             break;
 
         default:
+            if(b->action >= A_Step0 && b->action < A_Step0 + N_VAL(move_step_val)) {
+                move_step = b->action - A_Step0;
+                break;
+            }
             if(b->action >= A_Row0 && b->action < A_Row0 + LIST_ROWS) {
 
                 uint16_t i = list_top + (b->action - A_Row0);
