@@ -10,7 +10,7 @@
   or the enable switch, or reversing a direction, cancels the jog.
   Any implausible ADC value (broken wire, short) stops motion.
 
-  Place this file in Src\ (replace joystick_plugin.c) and keep -D ADD_MY_PLUGIN=1.
+  Started from my_plugin_init() in my_plugin.c (needs -D ADD_MY_PLUGIN=1).
 
   Requirements: soft limits on ($20=1), jog soft-limit clipping if available ($40=1).
 
@@ -405,7 +405,7 @@ static void joy_report_options (bool newopt)
     }
 }
 
-void my_plugin_init (void)
+void joystick_init (void)
 {
     dbg_analog = ioports_available(Port_Analog, Port_Input);
     dbg_port = IOPORT_UNASSIGNED - 1;       // 254: enable port not found
@@ -442,7 +442,4 @@ void my_plugin_init (void)
     on_realtime_report = grbl.on_realtime_report;
     grbl.on_realtime_report = joy_realtime_report;
 #endif
-
-    extern void tft_display_init (void);
-    tft_display_init(); // MKS TS35 status display, see tft_display.c
 }
