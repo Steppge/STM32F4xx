@@ -34,6 +34,10 @@ The BTT bootloader leaves the system clock running from the PLL. Upstream only s
 - Raw stick values and the enable level are appended to the status report (`|Joy:x,y,z,en`) for calibration.
 - Stick calibration and speeds are set at the top of the file.
 
+### Controller fan – [`Src/controller_fan.c`](Src/controller_fan.c)
+- The stepper driver fan on FAN2 runs while the drivers are enabled, like Marlin's `USE_CONTROLLER_FAN`.
+- `$1=60000`: after the last move the drivers stay enabled for 60 s with the hold current (`$210`-`$212`), then drivers and fan switch off.
+
 ### Touch display – [`Src/tft_display.c`](Src/tft_display.c)
 MKS TS35-R V2.0 (ST7796 480x320, XPT2046 touch) on EXP1/EXP2:
 - Main screen with state, work/machine position, SD job progress, feed rate and WCS; buttons for menu, home, unlock, zeroing, hold and start. The start button shows LOAD while no file is selected. The unlock button shows RESET while a hard limit alarm waits for a reset and is greyed out while a limit switch is engaged (strict mode).
@@ -59,7 +63,7 @@ MKS TS35-R V2.0 (ST7796 480x320, XPT2046 touch) on EXP1/EXP2:
    - `#define BOARD_MY_MACHINE` – pin map [`boards/my_machine_map.h`](boards/my_machine_map.h) (this machine's wiring, active by default)
    - `#define BOARD_BTT_OCTOPUS_PRO` – original grblHAL pin map for the Octopus Pro (v1.1)
 
-   Also check the other options in `my_machine.h` (motor currents, ganged Y axis, laser, ...). If you don't have the joystick and display, remove `-D ADD_MY_PLUGIN=1` from the `octopus_pro_f446` environment in `platformio.ini`.
+   Also check the other options in `my_machine.h` (motor currents, ganged Y axis, laser, ...). If you don't have the joystick, display and controller fan, remove `-D ADD_MY_PLUGIN=1` from the `octopus_pro_f446` environment in `platformio.ini`.
 4. Build the environment **`octopus_pro_f446`** (linker script `STM32F446ZETX_BL32K_NONVS_FLASH.ld`, 32K bootloader offset).
 5. Copy `.pio/build/octopus_pro_f446/firmware.bin` as `firmware.bin` to the SD card and power up the board.
 
