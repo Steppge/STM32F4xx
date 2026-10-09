@@ -98,7 +98,8 @@
 #define TFT_FORCE_UNLOCK_MS     3000    // hold UNLOCK this long to unlock without homing (homing required alarm)
 #define TFT_MOVE_RATE_PCT         30    // Move screen: jog feed rate in % of the axis max rate ($110-$112)
 #define TFT_REFRESH_MS           100    // values are read this often
-#define TFT_REFRESH_RUN_MS       250    // ... and this often while a job is running, leaves more time for the planner
+#define TFT_REFRESH_RUN_MS       500    // ... and this often while a job is running, leaves more time for the planner.
+                                        // Touch is polled every TOUCH_POLL_MS regardless, HOLD reacts at once and in hold the 100 ms refresh applies again (STOP/RESUME).
 #define TOUCH_POLL_MS             20
 
 #define PROBE_MAX_DIST         50.0f    // max. probing distance (mm), limited further by the work envelope
