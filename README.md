@@ -40,9 +40,11 @@ The BTT bootloader leaves the system clock running from the PLL. Upstream only s
 
 ### Touch display – [`Src/tft_display.c`](Src/tft_display.c)
 MKS TS35-R V2.0 (ST7796 480x320, XPT2046 touch) on EXP1/EXP2:
-- Main screen with state, work/machine position, SD job progress, feed rate and WCS; buttons for menu, home, unlock, zeroing, hold and start. The start button shows LOAD while no file is selected. The unlock button shows RESET while a hard limit alarm waits for a reset and is greyed out while a limit switch is engaged (strict mode).
+- Main screen with state, work/machine position, SD job progress, feed rate and WCS; buttons for menu, home, unlock, zeroing, hold and start. The start button shows LOAD while no file is selected. The unlock button shows RESET while a hard limit alarm waits for a reset and is greyed out while a limit switch is engaged (strict mode). With homing required after power-up (`$22=591`) it shows HOLD 3S: holding it unlocks without homing (no soft limits then).
+- Short alarm names in the status field (e.g. HARD LIM, LIMIT ON, NO HOME).
+- While a job runs: FEED -/+ and PWR -/+ instead of home/unlock/zeroing (tap = override -/+ 10 %, hold = 100 %), overrides shown in the info line. After HOLD the buttons show STOP (hold to abort the job) and RESUME.
 - Menu with zeroing, Z probing (sets Z0 with plate thickness), laser test pulse, SD card file list, settings, machine mode and a Move screen.
-- Move screen: jog X/Y/Z by tapping, step 0.001 / 0.01 / 0.1 / 1 / 10 mm per tap.
+- Move screen: jog X/Y/Z by tapping, step 0.01 / 0.05 / 0.1 / 1 / 10 mm per tap.
 - Touch calibration: hold the status bar on the main screen for 3 seconds while idle.
 - Buttons that move the machine or fire the laser must be held (long press).
 - Anti-aliased fonts and icons, drawn in small steps so the controller is never blocked.
@@ -66,6 +68,7 @@ MKS TS35-R V2.0 (ST7796 480x320, XPT2046 touch) on EXP1/EXP2:
    Also check the other options in `my_machine.h` (motor currents, ganged Y axis, laser, ...). If you don't have the joystick, display and controller fan, remove `-D ADD_MY_PLUGIN=1` from the `octopus_pro_f446` environment in `platformio.ini`.
 4. Build the environment **`octopus_pro_f446`** (linker script `STM32F446ZETX_BL32K_NONVS_FLASH.ld`, 32K bootloader offset).
 5. Copy `.pio/build/octopus_pro_f446/firmware.bin` as `firmware.bin` to the SD card and power up the board.
+   Or over USB (machine idle, no sender connected, needs `SDCARD_ENABLE 2` and pyserial): `python tools/upload_firmware.py --reboot` uploads the file to the SD card in the board with YModem and reboots, the bootloader then flashes it.
 
 ## Troubleshooting: grblHAL on the BTT Octopus Pro
 
