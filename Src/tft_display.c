@@ -15,11 +15,16 @@
   Screens:
     Main   state, work position (large), machine position or SD job progress, feed rate, WCS.
            MENU, HOME, UNLOCK, X0 Y0, Z0, HOLD, START.
+           After HOLD the buttons show STOP (hold to abort the job) and RESUME.
            UNLOCK shows RESET while a critical alarm (e.g. hard limit) waits for a reset.
+           With homing required ($22 init lock + override locks) it shows HOLD 3S: holding it
+           for TFT_FORCE_UNLOCK_MS resets and unlocks without homing (no soft limits!).
+           While a job runs HOME, UNLOCK, X0 Y0 and Z0 are replaced by FEED -/+ and PWR -/+:
+           tap = override -/+ 10 %, hold = back to 100 %.
            START resumes after HOLD/M0/tool change. When idle it opens the SD card list,
            or runs the selected file (hold). While no file is selected it is labelled LOAD.
     Menu   X=0, Y=0, Z=0, XYZ=0, PROBE Z, LASER, SD CARD, SETTINGS, MOVE, MODE
-    Move   jog X/Y/Z by tapping, step 0.001, 0.01, 0.1, 1 or 10 mm per tap
+    Move   jog X/Y/Z by tapping, step 0.01, 0.05, 0.1, 1 or 10 mm per tap
     Laser  test pulse with adjustable power and duration
     Probe  probe Z with the probe input, sets Z0 (plus plate thickness) and retracts
     SD     file list of the SD card root folder, select and run
@@ -90,9 +95,10 @@
 
 #define TFT_LONG_PRESS_MS        600    // buttons that move the machine or change offsets need a press this long
 #define TFT_CAL_HOLD_MS         3000    // hold the status bar this long to recalibrate touch
+#define TFT_FORCE_UNLOCK_MS     3000    // hold UNLOCK this long to unlock without homing (homing required alarm)
 #define TFT_MOVE_RATE_PCT         30    // Move screen: jog feed rate in % of the axis max rate ($110-$112)
 #define TFT_REFRESH_MS           100    // values are read this often
-#define TFT_REFRESH_RUN_MS       200    // ... and this often while a job is running, leaves more time for the planner
+#define TFT_REFRESH_RUN_MS       250    // ... and this often while a job is running, leaves more time for the planner
 #define TOUCH_POLL_MS             20
 
 #define PROBE_MAX_DIST         50.0f    // max. probing distance (mm), limited further by the work envelope
@@ -193,6 +199,7 @@ typedef enum {
     A_Mode,
     A_ScrMove, A_JogXm, A_JogXp, A_JogYm, A_JogYp, A_JogZm, A_JogZp,
     A_Step0, A_Step1, A_Step2, A_Step3, A_Step4,   // A_Step0 + index into move_step_val[]
+    A_OvrFeedDn, A_OvrFeedUp, A_OvrPwrDn, A_OvrPwrUp,
     A_Row0      // A_Row0 + row
 } action_t;
 
@@ -217,6 +224,7 @@ typedef struct {
     fire_t fire;
     style_t style;
     char icon;      // ICON_xxx, 0 = none
+    uint16_t hold_ms;   // Fire_LongPress: press time, 0 = TFT_LONG_PRESS_MS
     bool enabled;
     bool pressed;
     bool fired;
@@ -292,8 +300,8 @@ typedef enum {
 static const uint8_t laser_pwr_val[] = { 1, 2, 3, 5, 10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 90, 100 };
 static const uint16_t laser_time_val[] = { 10, 20, 50, 100, 200, 500, 1000, 2000 };
 static const uint16_t probe_feed_val[] = { 25, 50, 100, 150, 200, 300 };
-static const float move_step_val[] = { 0.001f, 0.01f, 0.1f, 1.0f, 10.0f };
-static const char *const move_step_label[] = { "0.001", "0.01", "0.1", "1", "10" };
+static const float move_step_val[] = { 0.01f, 0.05f, 0.1f, 1.0f, 10.0f };
+static const char *const move_step_label[] = { "0.01", "0.05", "0.1", "1", "10" };
 static uint8_t move_step = 3;   // index into move_step_val[], default 1 mm
 
 #define N_VAL(a) (sizeof(a) / sizeof(a[0]))
@@ -1635,6 +1643,48 @@ static const char *mode_label (void)
     return settings.mode == Mode_Laser ? "MODE LASER" : (settings.mode == Mode_Lathe ? "MODE LATHE" : "MODE SPINDLE");
 }
 
+// Main screen buttons 1-4: normal set and the override set shown while a job runs
+typedef struct {
+    const char *label;
+    action_t action;
+    fire_t fire;
+    char icon;
+} btn_def_t;
+
+static const btn_def_t main_idle_btn[4] = {
+    { "HOME",   A_Home,      Fire_LongPress, ICON_HOME },
+    { "UNLOCK", A_Unlock,    Fire_OnRelease, ICON_UNLOCK },
+    { "X0 Y0",  A_ZeroXY,    Fire_LongPress, ICON_CROSSHAIR },
+    { "Z0",     A_ZeroZ,     Fire_LongPress, ICON_ZERO_Z }
+};
+
+static const btn_def_t main_job_btn[4] = {
+    { "FEED -", A_OvrFeedDn, Fire_LongPress, 0 },   // tap: -10 %, hold: 100 %
+    { "FEED +", A_OvrFeedUp, Fire_LongPress, 0 },
+    { "PWR -",  A_OvrPwrDn,  Fire_LongPress, 0 },
+    { "PWR +",  A_OvrPwrUp,  Fire_LongPress, 0 }
+};
+
+static button_t *main_btn[4];
+static bool main_job = false;       // override set shown
+static bool unlock_pending = false; // forced unlock: send $X after the reset
+
+static void main_btn_set (button_t *b, const btn_def_t *def)
+{
+    b->label = def->label;
+    b->action = def->action;
+    b->fire = def->fire;
+    b->icon = def->icon;
+    b->hold_ms = 0;
+    b->pressed = b->fired = false;
+    b->dirty = true;
+}
+
+static bool is_override (action_t action)
+{
+    return action >= A_OvrFeedDn && action <= A_OvrPwrUp;
+}
+
 static bool list_keep = false;      // returning from a child screen: keep the list position
 static uint16_t top_mem[2];         // list positions of the settings group and settings lists
 static screen_t sd_back = Scr_Menu; // where BACK on the SD screen goes
@@ -1670,10 +1720,11 @@ static void screen_build (screen_t scr)
             field_add_aa(PROG_X + PROG_W - 90, INFO_Y, &aa_label, 6, 90, Align_Right, C_WHITE, C_BLACK);             // F_Pct
             mode_shown = 0xFF;
             button_add(0, 0, 96, BAR_H, "MENU", A_Menu, Fire_OnRelease)->icon = ICON_MENU;
-            button_add(0 * BTN_W, BTN_Y, BTN_W, BTN_H, "HOME", A_Home, Fire_LongPress)->icon = ICON_HOME;
-            button_add(1 * BTN_W, BTN_Y, BTN_W, BTN_H, "UNLOCK", A_Unlock, Fire_OnRelease)->icon = ICON_UNLOCK;
-            button_add(2 * BTN_W, BTN_Y, BTN_W, BTN_H, "X0 Y0", A_ZeroXY, Fire_LongPress)->icon = ICON_CROSSHAIR;
-            button_add(3 * BTN_W, BTN_Y, BTN_W, BTN_H, "Z0", A_ZeroZ, Fire_LongPress)->icon = ICON_ZERO_Z;
+            for(uint_fast8_t i = 0; i < 4; i++) {
+                main_btn[i] = button_add(i * BTN_W, BTN_Y, BTN_W, BTN_H, "", A_None, Fire_OnRelease);
+                main_btn_set(main_btn[i], &main_idle_btn[i]);
+            }
+            main_job = false;
             {
                 button_t *b = button_add(4 * BTN_W, BTN_Y, BTN_W, BTN_H, "HOLD", A_Hold, Fire_OnPress);
                 b->icon = ICON_PAUSE;
@@ -1840,7 +1891,21 @@ static void state_info (sys_state_t state, char *text, uint16_t *bg, char *icon)
         *bg = C_RED;
         *icon = ICON_STOP;
     } else if(state & STATE_ALARM) {
-        sprintf(text, "ALARM:%u", (unsigned)sys.alarm);
+        switch(sys.alarm) {     // must fit the 100 px status field (aa_state)
+            case Alarm_HardLimit:           strcpy(text, "HARD LIM"); break;
+            case Alarm_SoftLimit:           strcpy(text, "SOFT LIM"); break;
+            case Alarm_AbortCycle:          strcpy(text, "ABORTED"); break;
+            case Alarm_ProbeFailInitial:
+            case Alarm_ProbeFailContact:    strcpy(text, "PROBE ERR"); break;
+            case Alarm_HomingFailReset:
+            case Alarm_HomingFailDoor:
+            case Alarm_FailPulloff:
+            case Alarm_HomingFailApproach:  strcpy(text, "HOME FAIL"); break;
+            case Alarm_EStop:               strcpy(text, "E-STOP"); break;
+            case Alarm_HomingRequired:      strcpy(text, "NO HOME"); break;
+            case Alarm_LimitsEngaged:       strcpy(text, "LIMIT ON"); break;
+            default:                        sprintf(text, "ALARM:%u", (unsigned)sys.alarm); break;
+        }
         *bg = C_RED;
         *icon = ICON_ALERT;
     } else if(state & STATE_SAFETY_DOOR) {
@@ -1892,18 +1957,42 @@ static void refresh_values (sys_state_t state)
     for(uint_fast8_t i = 0; i < 3; i++)
         wpos[i] = mpos[i] - gc_get_offset(i, true);
 
+    // While a job runs the main screen shows the override buttons instead of HOME, UNLOCK, X0 Y0 and Z0
+    if(screen == Scr_Main) {
+        bool job = !!(state & (STATE_CYCLE|STATE_HOLD|STATE_TOOL_CHANGE));
+        if(job != main_job) {
+            main_job = job;
+            for(uint_fast8_t i = 0; i < 4; i++)
+                main_btn_set(main_btn[i], job ? &main_job_btn[i] : &main_idle_btn[i]);
+        }
+    }
+
+    // Forced unlock: the reset has cleared the homing lock, now unlock
+    if(unlock_pending && !(state & STATE_ALARM))
+        unlock_pending = false;
+    else if(unlock_pending && !sys.blocking_event && sys.alarm != Alarm_HomingRequired && enqueue("$X"))
+        unlock_pending = false;
+
     for(uint_fast8_t i = 0; i < n_buttons; i++) {
         button_t *b = &buttons[i];
         switch(b->action) {
             case A_Home:      button_set_enabled(b, idle || (state & STATE_ALARM)); break;
             case A_Unlock:
                 {
-                    // RESET while a critical alarm (hard limit, e-stop) waits for a reset, UNLOCK otherwise
-                    const char *label = sys.blocking_event ? "RESET" : "UNLOCK";
+                    // RESET while a critical alarm (hard limit, e-stop) waits for a reset,
+                    // HOLD 3S while homing is required (forced unlock), UNLOCK otherwise
+                    bool homing_lock = !sys.blocking_event && (state & STATE_ALARM) && sys.alarm == Alarm_HomingRequired;
+                    const char *label = sys.blocking_event ? "RESET" : (homing_lock ? "HOLD 3S" : "UNLOCK");
                     if(strcmp(b->label, label)) {
                         b->label = label;
                         b->icon = sys.blocking_event ? ICON_ALERT : ICON_UNLOCK;
                         b->dirty = true;
+                    }
+                    b->fire = homing_lock ? Fire_LongPress : Fire_OnRelease;
+                    b->hold_ms = homing_lock ? TFT_FORCE_UNLOCK_MS : 0;
+                    if(homing_lock && !settings.homing.flags.override_locks) {
+                        button_set_enabled(b, false);   // $22 without override locks: only homing helps
+                        break;
                     }
                     // in strict mode ($21 bit 1) $X is refused while a limit switch is engaged, only homing helps
                     bool engaged = !sys.blocking_event && settings.limits.flags.hard_enabled && settings.limits.flags.check_at_init &&
@@ -1918,12 +2007,27 @@ static void refresh_values (sys_state_t state)
             case A_ZeroXYZ:
             case A_TouchCal:
             case A_ScrSd:     button_set_enabled(b, idle); break;
-            case A_Hold:      button_set_enabled(b, !!(state & (STATE_CYCLE|STATE_JOG))); break;
+            case A_Hold:
+                {
+                    // HOLD while running, STOP (hold to abort the job) once the hold is complete
+                    bool stop = (state & STATE_HOLD) && sys.holding_state == Hold_Complete;
+                    const char *label = stop ? "STOP" : "HOLD";
+                    if(strcmp(b->label, label)) {
+                        b->label = label;
+                        b->icon = stop ? ICON_STOP : ICON_PAUSE;
+                        b->style = stop ? Style_Danger : Style_Warn;
+                        b->fire = stop ? Fire_LongPress : Fire_OnPress;   // fired stays set while the finger is still down from HOLD
+                        b->dirty = true;
+                    }
+                    button_set_enabled(b, stop || !!(state & (STATE_CYCLE|STATE_JOG)));
+                }
+                break;
             case A_Start:
                 {
                     // LOAD while no file is selected (tap opens the file list), START otherwise
-                    bool load = !(state & (STATE_HOLD|STATE_TOOL_CHANGE)) && !*sd_path;
-                    const char *label = load ? "LOAD" : "START";
+                    bool held = !!(state & (STATE_HOLD|STATE_TOOL_CHANGE));
+                    bool load = !held && !*sd_path;
+                    const char *label = held ? "RESUME" : (load ? "LOAD" : "START");
                     if(strcmp(b->label, label)) {
                         b->label = label;
                         b->icon = load ? ICON_SD_CARD : ICON_PLAY;
@@ -1940,6 +2044,10 @@ static void refresh_values (sys_state_t state)
                 }
                 break;
             case A_Fire:      button_set_enabled(b, idle && !laser_active && !spindle_is_on()); break;
+            case A_OvrFeedDn:
+            case A_OvrFeedUp:
+            case A_OvrPwrDn:
+            case A_OvrPwrUp:  button_set_enabled(b, true); break;
             case A_JogXm:
             case A_JogXp:
             case A_JogYm:
@@ -2033,6 +2141,16 @@ static void refresh_values (sys_state_t state)
                 field_set(F_Pct, "");
                 if(*sd_path && idle)
                     snprintf(buf, sizeof(buf), "File: %s", sd_path + 1);
+            }
+            if(main_job) {      // overrides differing from 100 % at the end of the info line
+                spindle_ptrs_t *spindle = spindle_get(0);
+                unsigned feed = sys.override.feed_rate, pwr = spindle && spindle->param ? spindle->param->override_pct : 100;
+                if(feed != 100 || pwr != 100) {
+                    char ovr[24];
+                    snprintf(ovr, sizeof(ovr), "  F%u%% P%u%%", feed, pwr);
+                    buf[38 - strlen(ovr) < strlen(buf) ? 38 - strlen(ovr) : strlen(buf)] = '\0';
+                    strcat(buf, ovr);
+                }
             }
             field_set(F_Info, buf);
             break;
@@ -2152,15 +2270,30 @@ static void action_run (button_t *b)
         case A_Unlock:
             if(sys.blocking_event)
                 grbl.enqueue_realtime_command(CMD_RESET);
-            else
+            else if(sys.alarm == Alarm_HomingRequired) {
+                if(b->fired) {          // held: reset clears the homing lock ($22 override locks), then $X
+                    unlock_pending = true;
+                    grbl.enqueue_realtime_command(CMD_RESET);
+                }
+            } else
                 enqueue("$X");
             break;
+
+        case A_OvrFeedDn: grbl.enqueue_realtime_command(b->fired ? CMD_OVERRIDE_FEED_RESET : CMD_OVERRIDE_FEED_COARSE_MINUS); break;
+        case A_OvrFeedUp: grbl.enqueue_realtime_command(b->fired ? CMD_OVERRIDE_FEED_RESET : CMD_OVERRIDE_FEED_COARSE_PLUS); break;
+        case A_OvrPwrDn:  grbl.enqueue_realtime_command(b->fired ? CMD_OVERRIDE_SPINDLE_RESET : CMD_OVERRIDE_SPINDLE_COARSE_MINUS); break;
+        case A_OvrPwrUp:  grbl.enqueue_realtime_command(b->fired ? CMD_OVERRIDE_SPINDLE_RESET : CMD_OVERRIDE_SPINDLE_COARSE_PLUS); break;
         case A_ZeroXY:    enqueue("G10L20P0X0Y0"); break;
         case A_ZeroZ:     enqueue("G10L20P0Z0"); break;
         case A_ZeroX:     enqueue("G10L20P0X0"); break;
         case A_ZeroY:     enqueue("G10L20P0Y0"); break;
         case A_ZeroXYZ:   enqueue("G10L20P0X0Y0Z0"); break;
-        case A_Hold:      grbl.enqueue_realtime_command(CMD_FEED_HOLD); break;
+        case A_Hold:
+            if(b->fire == Fire_LongPress)   // STOP: abort the held job, the machine stands still so the position is kept
+                grbl.enqueue_realtime_command(CMD_RESET);
+            else
+                grbl.enqueue_realtime_command(CMD_FEED_HOLD);
+            break;
 
         case A_Start:
             if(state_get() & (STATE_HOLD|STATE_TOOL_CHANGE))
@@ -2282,8 +2415,8 @@ static void touch_release (void)
 {
     if(touch_btn >= 0 && touch_btn < n_buttons) {
         button_t *b = &buttons[touch_btn];
-        // START with a file selected: released before the long press time = tap, opens the file list
-        bool tap = b->fire == Fire_OnRelease || (b->action == A_Start && b->fire == Fire_LongPress);
+        // START with a file selected and the override buttons: released before the long press time = tap
+        bool tap = b->fire == Fire_OnRelease || (b->fire == Fire_LongPress && (b->action == A_Start || is_override(b->action)));
         if(tap && b->enabled && !b->fired) {
             b->pressed = false;
             b->dirty = true;
@@ -2352,7 +2485,7 @@ static bool touch_poll (uint32_t now)
                 b->pressed = b->fired = false;
                 b->dirty = true;
                 touch_btn = -1;
-            } else if(b->fire == Fire_LongPress && !b->fired && b->enabled && now - touch_down_ms >= TFT_LONG_PRESS_MS) {
+            } else if(b->fire == Fire_LongPress && !b->fired && b->enabled && now - touch_down_ms >= (b->hold_ms ? b->hold_ms : TFT_LONG_PRESS_MS)) {
                 b->fired = true;
                 b->dirty = true;
                 action_run(b);
