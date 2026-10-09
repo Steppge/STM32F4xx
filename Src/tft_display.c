@@ -2119,7 +2119,7 @@ static void refresh_values (sys_state_t state)
             field_set(F_Wcs, gc_coord_system_to_str(gc_state.modal.g5x_offset.id));
 
             for(uint_fast8_t i = 0; i < 3; i++) {
-                snprintf(buf, sizeof(buf), "%8.3f", wpos[i]);
+                snprintf(buf, sizeof(buf), "%8.2f", wpos[i]);
                 field_set(F_X + i, buf);
                 snprintf(buf, sizeof(buf), "%8.2f", mpos[i]);
                 field_set(F_MX + i, buf);
@@ -2157,7 +2157,7 @@ static void refresh_values (sys_state_t state)
 
         case Scr_Menu:
         case Scr_Move:
-            snprintf(buf, sizeof(buf), "X %.3f     Y %.3f     Z %.3f", wpos[0], wpos[1], wpos[2]);
+            snprintf(buf, sizeof(buf), "X %.2f     Y %.2f     Z %.2f", wpos[0], wpos[1], wpos[2]);
             field_set(F_Pos, buf);
             break;
 
