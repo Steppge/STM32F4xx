@@ -1170,6 +1170,19 @@ static bool enqueue (const char *cmd)
     return grbl.enqueue_gcode(buf);
 }
 
+// Move step shared with the gamepad plugin (Share button cycles it).
+float tft_move_step_mm (void)
+{
+    return move_step_val[move_step];
+}
+
+float tft_move_step_next (void)
+{
+    move_step = (move_step + 1) % N_VAL(move_step_val);
+
+    return move_step_val[move_step];
+}
+
 // Move screen: jog one step of the selected size along an axis.
 static void move_jog (uint_fast8_t axis, float dir)
 {

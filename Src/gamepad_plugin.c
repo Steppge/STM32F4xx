@@ -1,7 +1,7 @@
 /*
   gamepad_plugin.c - jogging with a Bluetooth gamepad for grblHAL (STM32F4xx, BTT Octopus Pro)
 
-  PROTOTYPE v0.2 - jogging, jog enable on Options, connection watchdog. Keep a hand on the power switch.
+  PROTOTYPE v0.3 - jogging, jog enable on Options, buttons, connection watchdog. Keep a hand on the power switch.
 
   An ESP32 (see esp32_gamepad/) connects a PS4 controller (DualShock 4; DualSense and Xbox
   Series X|S work the same way) and sends its state every 20 ms over UART to the TFT header
@@ -21,6 +21,18 @@
     right stick left/right  X
     L2 / R2 (analog)        Z up / Z down (both pressed: Z stops)
     Options                 jog enable on/off (light bar red / blue)
+
+  Buttons ("hold" = GP_HOLD_MS):
+
+    Circle      tap: feed hold (job or jog), after the hold has completed: hold = STOP (abort the job)
+    Cross       tap: resume (cycle start) after a hold or tool change
+    Triangle    hold: home ($H)
+    Square      hold: X0 Y0 (G10 L20 P0)
+    R1          hold: Z0
+    PS          tap: reset after a critical alarm (hard limit), else unlock ($X)
+    Share       tap: next jog step 0.01 / 0.05 / 0.1 / 1 / 10 mm (shared with the display Move screen)
+    D-pad       idle: one jog step X-/X+/Y-/Y+ per press, needs jog enable
+                job:  up/down feed override +/-10 %, right/left power (spindle) override +/-10 %
 
   Safety: releasing a stick or trigger stops the axis, no valid packet for GP_TIMEOUT_MS stops
   everything. Jog enable switches off by itself after GP_ENABLE_IDLE_MS without motion, when the
@@ -47,7 +59,7 @@
 #include "grbl/settings.h"
 #include "grbl/stream.h"
 
-#define GP_VERSION "0.2"
+#define GP_VERSION "0.3"
 
 // ------------------------------------------------------------------------
 // Configuration
@@ -64,7 +76,25 @@
 #define GP_TRIGGER_DZ      50       // trigger travel that counts as released (about 5 %)
 #define GP_ENABLE_IDLE_MS 60000     // jog enable switches off after this long without motion
 
-#define GP_MISC_OPTIONS  0x04       // Bluepad32 MISC_BUTTON_START (PS4 Options)
+#define GP_HOLD_MS        600       // press time for "hold" buttons
+#define GP_STEP_RATE_PCT  30.0f     // D-pad step jog feed in % of the axis max rate
+
+// Bluepad32 button bits (PS4 names)
+#define GP_BTN_CROSS     0x0001     // BUTTON_A
+#define GP_BTN_CIRCLE    0x0002     // BUTTON_B
+#define GP_BTN_SQUARE    0x0004     // BUTTON_X
+#define GP_BTN_TRIANGLE  0x0008     // BUTTON_Y
+#define GP_BTN_R1        0x0020     // BUTTON_SHOULDER_R
+#define GP_MISC_PS       0x01       // MISC_BUTTON_SYSTEM
+#define GP_MISC_SHARE    0x02       // MISC_BUTTON_SELECT
+#define GP_MISC_OPTIONS  0x04       // MISC_BUTTON_START (Options)
+#define GP_DPAD_UP       0x01
+#define GP_DPAD_DOWN     0x02
+#define GP_DPAD_RIGHT    0x04
+#define GP_DPAD_LEFT     0x08
+
+extern float tft_move_step_mm (void);
+extern float tft_move_step_next (void);
 
 #define GP_INVERT_X         1       // 1: reverse the jog direction of an axis
 #define GP_INVERT_Y         1
@@ -382,6 +412,169 @@ static void set_enabled (bool on, sys_state_t state)
     }
 }
 
+// ------------------------------------------------------------------------
+// Buttons
+// ------------------------------------------------------------------------
+
+typedef enum {
+    Btn_Circle = 0, Btn_Cross, Btn_Triangle, Btn_Square, Btn_R1, Btn_PS, Btn_Share,
+    Btn_Up, Btn_Down, Btn_Right, Btn_Left,
+    Btn_Count
+} gp_button_t;
+
+typedef struct {
+    bool down;
+    bool fired;         // hold action done for this press
+    uint32_t since;     // ms, press start
+} btn_state_t;
+
+static btn_state_t btn[Btn_Count];
+
+static bool is_down (gp_button_t b)
+{
+    switch(b) {
+        case Btn_Circle:   return !!(pad.buttons & GP_BTN_CIRCLE);
+        case Btn_Cross:    return !!(pad.buttons & GP_BTN_CROSS);
+        case Btn_Triangle: return !!(pad.buttons & GP_BTN_TRIANGLE);
+        case Btn_Square:   return !!(pad.buttons & GP_BTN_SQUARE);
+        case Btn_R1:       return !!(pad.buttons & GP_BTN_R1);
+        case Btn_PS:       return !!(pad.misc & GP_MISC_PS);
+        case Btn_Share:    return !!(pad.misc & GP_MISC_SHARE);
+        case Btn_Up:       return !!(pad.dpad & GP_DPAD_UP);
+        case Btn_Down:     return !!(pad.dpad & GP_DPAD_DOWN);
+        case Btn_Right:    return !!(pad.dpad & GP_DPAD_RIGHT);
+        case Btn_Left:     return !!(pad.dpad & GP_DPAD_LEFT);
+        default:           return false;
+    }
+}
+
+static bool enqueue (const char *cmd)
+{
+    char buf[48];
+
+    strncpy(buf, cmd, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    return grbl.enqueue_gcode(buf);
+}
+
+// One jog step of the shared Move step size along X or Y.
+static void step_jog (uint_fast8_t axis, float dir)
+{
+    char cmd[48];
+
+    if((axis == X_AXIS && GP_INVERT_X) || (axis == Y_AXIS && GP_INVERT_Y))
+        dir = -dir;
+
+    snprintf(cmd, sizeof(cmd), "$J=G91G21%c%.3fF%.0f", axis == X_AXIS ? 'X' : 'Y', dir * tft_move_step_mm(),
+              settings.axis[axis].max_rate * GP_STEP_RATE_PCT / 100.0f);
+    if(enqueue(cmd))
+        enabled_since = hal.get_elapsed_ticks();
+}
+
+// Tap action, called on press.
+static void on_press (gp_button_t b, sys_state_t state)
+{
+    bool job = !!(state & (STATE_CYCLE|STATE_HOLD|STATE_TOOL_CHANGE));
+
+    switch(b) {
+
+        case Btn_Circle:
+            if(state & (STATE_CYCLE|STATE_JOG))
+                grbl.enqueue_realtime_command(CMD_FEED_HOLD);
+            break;
+
+        case Btn_Cross:
+            if(state & (STATE_HOLD|STATE_TOOL_CHANGE))
+                grbl.enqueue_realtime_command(CMD_CYCLE_START);
+            break;
+
+        case Btn_PS:
+            if(sys.blocking_event)
+                grbl.enqueue_realtime_command(CMD_RESET);
+            else if((state & STATE_ALARM) && sys.alarm != Alarm_HomingRequired)
+                enqueue("$X");
+            break;
+
+        case Btn_Share:
+            tft_move_step_next();
+            send_state(state, 3);
+            break;
+
+        case Btn_Up:
+        case Btn_Down:
+            if(job)
+                grbl.enqueue_realtime_command(b == Btn_Up ? CMD_OVERRIDE_FEED_COARSE_PLUS : CMD_OVERRIDE_FEED_COARSE_MINUS);
+            else if(enabled && state == STATE_IDLE)
+                step_jog(Y_AXIS, b == Btn_Up ? 1.0f : -1.0f);
+            break;
+
+        case Btn_Right:
+        case Btn_Left:
+            if(job)
+                grbl.enqueue_realtime_command(b == Btn_Right ? CMD_OVERRIDE_SPINDLE_COARSE_PLUS : CMD_OVERRIDE_SPINDLE_COARSE_MINUS);
+            else if(enabled && state == STATE_IDLE)
+                step_jog(X_AXIS, b == Btn_Right ? 1.0f : -1.0f);
+            break;
+
+        default:
+            break;
+    }
+}
+
+// Hold action, called once when the button has been held for GP_HOLD_MS.
+static void on_hold (gp_button_t b, sys_state_t state)
+{
+    bool idle = state == STATE_IDLE;
+
+    switch(b) {
+
+        case Btn_Circle:    // STOP: abort the held job, the machine stands still so the position is kept
+            if((state & STATE_HOLD) && sys.holding_state == Hold_Complete) {
+                grbl.enqueue_realtime_command(CMD_RESET);
+                send_state(state, 3);
+            }
+            break;
+
+        case Btn_Triangle:
+            if((idle || (state & STATE_ALARM)) && enqueue("$H"))
+                send_state(state, 3);
+            break;
+
+        case Btn_Square:
+            if(idle && enqueue("G10L20P0X0Y0"))
+                send_state(state, 3);
+            break;
+
+        case Btn_R1:
+            if(idle && enqueue("G10L20P0Z0"))
+                send_state(state, 3);
+            break;
+
+        default:
+            break;
+    }
+}
+
+static void poll_buttons (sys_state_t state, uint32_t now)
+{
+    for(uint_fast8_t i = 0; i < Btn_Count; i++) {
+
+        bool down = is_down((gp_button_t)i);
+
+        if(down && !btn[i].down) {
+            btn[i].since = now;
+            btn[i].fired = false;
+            on_press((gp_button_t)i, state);
+        } else if(down && !btn[i].fired && now - btn[i].since >= GP_HOLD_MS) {
+            btn[i].fired = true;
+            on_hold((gp_button_t)i, state);
+        }
+
+        btn[i].down = down;
+    }
+}
+
 static void gp_realtime (sys_state_t state)
 {
     static bool was_connected = false, options_was = false;
@@ -403,11 +596,12 @@ static void gp_realtime (sys_state_t state)
 
     bool connected = alive && pad.connected;
 
-    // Lost connection or new connection: jog enable off.
+    // Lost connection or new connection: jog enable off, buttons released.
     if(connected != was_connected) {
         was_connected = connected;
         options_was = false;
         memset(step, 0, sizeof(step));
+        memset(btn, 0, sizeof(btn));
         set_enabled(false, state);
     }
 
@@ -424,6 +618,9 @@ static void gp_realtime (sys_state_t state)
             set_enabled(true, state);
     }
     options_was = options;
+
+    if(connected)
+        poll_buttons(state, now);
 
     if(alive)
         send_state(state, 0);
