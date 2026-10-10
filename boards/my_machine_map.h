@@ -242,15 +242,19 @@
 #define AUXINPUT5_PIN               4
 //#define AUXINPUT6_PORT              GPIOF       // Cycle start - T1
 //#define AUXINPUT6_PIN               5
+#if JOYSTICK_ANALOG_ENABLE
 #define AUXINPUT7_PORT              GPIOG       // Joystick enable (Stop7)
 #define AUXINPUT7_PIN               15
+#endif
 
+#if JOYSTICK_ANALOG_ENABLE
 #define AUXINPUT0_ANALOG_PORT       GPIOF       // TH1 = X stick
 #define AUXINPUT0_ANALOG_PIN        5
 #define AUXINPUT1_ANALOG_PORT       GPIOF       // TH2 = Y stick
 #define AUXINPUT1_ANALOG_PIN        6
 #define AUXINPUT2_ANALOG_PORT       GPIOF       // TH3 = Z stick
 #define AUXINPUT2_ANALOG_PIN        7
+#endif
 
 // Define user-control controls (cycle start, reset, feed hold) input pins.
 #if CONTROL_ENABLE & CONTROL_HALT

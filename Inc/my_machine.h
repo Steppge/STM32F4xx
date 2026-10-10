@@ -171,6 +171,10 @@
 //#define LIMITS_OVERRIDE_ENABLE  1
 #define NGC_EXPRESSIONS_ENABLE 1
 #define CONTROL_ENABLE (CONTROL_HALT|CONTROL_FEED_HOLD)
+
+// Jogging device, started from Src/my_plugin.c (needs -D ADD_MY_PLUGIN=1). Enable only one:
+#define JOYSTICK_ANALOG_ENABLE  0 // analog joystick on TH1-TH3, enable switch on Stop7 (PG15), see joystick_plugin.c
+#define GAMEPAD_ENABLE          1 // PS4/PS5/Xbox controller via ESP32 on the TFT header (USART1), see gamepad_plugin.c
 /**/
 // If the selected board map supports more than three motors ganging and/or auto-squaring
 // of axes can be enabled here.
