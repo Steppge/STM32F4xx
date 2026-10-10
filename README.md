@@ -138,9 +138,13 @@ MKS TS35-R V2.0 (ST7796 480x320, XPT2046 touch) on EXP1/EXP2:
 
 Overrides other than 100 % are shown at the end of the info line, e.g. `logo.nc  F110% P90%`. While a job runs the values on the display are refreshed every 500 ms, the touch screen is still polled every 20 ms.
 
-| Main screen (idle) | Main screen (job running) | Menu |
+| Main screen (idle) | Job running | Job held |
 |---|---|---|
-| ![Main screen idle](media/display/main_idle.png) | ![Main screen job](media/display/main_job.png) | ![Menu](media/display/menu.png) |
+| ![Main screen idle](media/display/main_idle.png) | ![Job running](media/display/main_job.png) | ![Job held](media/display/main_hold.png) |
+
+| Menu | Move screen |
+|---|---|
+| ![Menu](media/display/menu.png) | ![Move screen](media/display/move.png) |
 
 *Rendered previews: PC simulation of the display drawing code with the firmware's font data and example values, shown at 2x size.*
 
