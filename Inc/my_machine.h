@@ -174,7 +174,10 @@
 
 // Jogging device, started from Src/my_plugin.c (needs -D ADD_MY_PLUGIN=1). Enable only one:
 #define JOYSTICK_ANALOG_ENABLE  0 // analog joystick on TH1-TH3, enable switch on Stop7 (PG15), see joystick_plugin.c
+//#define JOYSTICK_ENABLE_PORT    3 // aux input port of the enable switch, default 3 (Octopus Pro: PG15)
+//#define JOYSTICK_PORT_X         0 // analog aux input ports of the sticks, default 0, 1, 2
 #define GAMEPAD_ENABLE          1 // PS4/PS5/Xbox controller via ESP32 on the TFT header (USART1), see gamepad_plugin.c
+//#define GAMEPAD_STREAM          0 // serial stream instance for the ESP32, default 0 (Octopus Pro: TFT header)
 /**/
 // If the selected board map supports more than three motors ganging and/or auto-squaring
 // of axes can be enabled here.

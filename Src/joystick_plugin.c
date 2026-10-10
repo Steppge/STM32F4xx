@@ -3,7 +3,8 @@
 
   PROTOTYPE v0.5 - tested only in short bench runs. Keep a hand on the power switch.
 
-  Reads three analog inputs (X, Y, Z stick) plus one digital enable input (PG15).
+  Reads three analog inputs (X, Y, Z stick) plus one digital enable input (Octopus Pro: PG15),
+  all through the grblHAL ioports API. Port numbers: JOYSTICK_PORT_X/Y/Z, JOYSTICK_ENABLE_PORT.
   While the enable switch is held and a stick is out of its dead zone, the plugin
   streams short jog segments. Speed follows the stick deflection and changes take
   effect with the next segment, so the motion stays smooth. Releasing the stick
@@ -31,6 +32,10 @@
    - JOY_STEPS speed steps per direction with hysteresis, readings are smoothed, smaller dead zone.
    - step 1 has a fixed slow speed (JOY_FEED_MIN_*) for touching off, steps 2..JOY_STEPS
      rise up to JOY_MAX_RATE_PCT of the axis max rate ($110-$112).
+
+  Changes in v0.6:
+   - enable switch read through the grblHAL ioports API instead of the STM32 GPIO registers,
+     port numbers configurable (JOYSTICK_ENABLE_PORT, JOYSTICK_PORT_X/Y/Z), not tied to a MCU.
 */
 
 #include "driver.h"
@@ -48,16 +53,26 @@
 #include "grbl/planner.h"
 #include "grbl/settings.h"
 
-#define JOY_VERSION "0.5"
+#define JOY_VERSION "0.6"
 
 // ------------------------------------------------------------------------
 // Configuration - adjust to your sticks
 // ------------------------------------------------------------------------
 
 // Analog port numbers (order of AUXINPUTn_ANALOG in the board map).
-#define JOY_PORT_X 0
-#define JOY_PORT_Y 1
-#define JOY_PORT_Z 2
+// Can be set in my_machine.h.
+#ifndef JOYSTICK_PORT_X
+#define JOYSTICK_PORT_X 0
+#endif
+#ifndef JOYSTICK_PORT_Y
+#define JOYSTICK_PORT_Y 1
+#endif
+#ifndef JOYSTICK_PORT_Z
+#define JOYSTICK_PORT_Z 2
+#endif
+#define JOY_PORT_X JOYSTICK_PORT_X
+#define JOY_PORT_Y JOYSTICK_PORT_Y
+#define JOY_PORT_Z JOYSTICK_PORT_Z
 
 typedef struct {
     int32_t min;        // ADC value, stick fully in one direction
@@ -93,11 +108,12 @@ static const joy_axis_cfg_t joy_cfg[3] = {
 #define JOY_BRAKE_MARGIN    1.2f    // segment is at least this times the braking distance
 #define JOY_ENABLE_ACTIVE_LOW  1    // 1: enable switch pulls the input low
 
-// Enable switch on PG15 (Stop7), read directly from the GPIO register.
-// $pins shows it as: [PIN:PG15,Aux in 6,P3]
-#define JOY_EN_PORT   GPIOG
-#define JOY_EN_PIN    15
-#define JOY_ENABLE_PORT 3
+// Enable switch: digital aux input port number, can be set in my_machine.h.
+// Octopus Pro: PG15 (Stop7), $pins shows it as [PIN:PG15,Aux in 6,P3].
+#ifndef JOYSTICK_ENABLE_PORT
+#define JOYSTICK_ENABLE_PORT 3
+#endif
+#define JOY_ENABLE_PORT JOYSTICK_ENABLE_PORT
 
 // Debug: append the raw stick values and the enable input to every status report, e.g.
 //   <Idle|MPos:...|Joy:1437,1437,1534,1>   (X, Y, Z ADC value, enable input level)
@@ -227,7 +243,7 @@ static float step_feed (uint_fast8_t axis, int8_t q)
 
 static bool enable_active (void)
 {
-    bool level = DIGITAL_IN(JOY_EN_PORT, JOY_EN_PIN);
+    bool level = ioport_wait_on_input(Port_Digital, enable_port, WaitMode_Immediate, 0.0f) == 1;
 
 #if JOY_ENABLE_ACTIVE_LOW
     return !level;
@@ -380,7 +396,7 @@ static void joy_realtime_report (stream_write_ptr stream_write, report_tracking_
                   (long)ioport_wait_on_input(Port_Analog, JOY_PORT_X, WaitMode_Immediate, 0.0f),
                    (long)ioport_wait_on_input(Port_Analog, JOY_PORT_Y, WaitMode_Immediate, 0.0f),
                     (long)ioport_wait_on_input(Port_Analog, JOY_PORT_Z, WaitMode_Immediate, 0.0f),
-                     (long)DIGITAL_IN(JOY_EN_PORT, JOY_EN_PIN));
+                     (long)ioport_wait_on_input(Port_Digital, enable_port, WaitMode_Immediate, 0.0f));
 
         stream_write(buf);
     }
@@ -410,21 +426,18 @@ void joystick_init (void)
     dbg_analog = ioports_available(Port_Analog, Port_Input);
     dbg_port = IOPORT_UNASSIGNED - 1;       // 254: enable port not found
 
-    // The enable input must be exactly PG15, otherwise the plugin stays inactive.
+    // The enable input is read through the grblHAL ioports API (not tied to a MCU). It is not
+    // claimed so the port number stays valid for reading, only the description is set for $pins.
     xbar_t *info = ioport_get_info(Port_Digital, Port_Input, JOY_ENABLE_PORT);
 
     if(info) {
-        if((GPIO_TypeDef *)info->port == JOY_EN_PORT && info->pin == JOY_EN_PIN) {
-
-            uint8_t port = JOY_ENABLE_PORT;
-            ioport_claim(Port_Digital, Port_Input, &port, "Joystick enable"); // result ignored, reading is direct
-
-            // Internal pull-up so the input idles high when the switch is open (same PUPDR method the driver uses).
-            JOY_EN_PORT->PUPDR = (JOY_EN_PORT->PUPDR & ~(3u << (JOY_EN_PIN * 2))) | (1u << (JOY_EN_PIN * 2));
-
-            dbg_port = JOY_ENABLE_PORT;
-        } else
-            dbg_port = IOPORT_UNASSIGNED - 2; // 253: port number is not PG15
+        // Pull-up so the input idles high when the switch is open, if the driver supports it.
+        if(info->config) {
+            gpio_in_config_t cfg = { .pull_mode = PullMode_Up };
+            info->config(info, &cfg, false);
+        }
+        ioport_set_description(Port_Digital, Port_Input, JOY_ENABLE_PORT, "Joystick enable");
+        dbg_port = JOY_ENABLE_PORT;
     }
 
     if(dbg_analog >= 3 && dbg_port == JOY_ENABLE_PORT) {

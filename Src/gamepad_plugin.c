@@ -40,6 +40,8 @@
   on while all sticks and triggers are at rest and the machine is idle.
 
   Enabled with GAMEPAD_ENABLE in my_machine.h, started from my_plugin_init() in my_plugin.c.
+  Optional in my_machine.h: GAMEPAD_STREAM (serial stream instance, default 0), GAMEPAD_BAUD (115200).
+  Only grblHAL core APIs are used, so the plugin is not tied to the STM32F4 driver.
 */
 
 #include "driver.h"
@@ -65,8 +67,16 @@
 // Configuration
 // ------------------------------------------------------------------------
 
-#define GP_STREAM           0       // serial stream instance: 0 = USART1 on the TFT header
-#define GP_BAUD        115200
+// Serial stream instance and baud rate, can be set in my_machine.h.
+// Octopus Pro: instance 0 = USART1 on the TFT header (SERIAL_PORT in the board map).
+#ifndef GAMEPAD_STREAM
+#define GAMEPAD_STREAM      0
+#endif
+#ifndef GAMEPAD_BAUD
+#define GAMEPAD_BAUD   115200
+#endif
+#define GP_STREAM           GAMEPAD_STREAM
+#define GP_BAUD             GAMEPAD_BAUD
 #define GP_TIMEOUT_MS     200       // no valid packet for this long = connection lost
 
 #define GP_AXIS_MAX       512       // Bluepad32 stick range -512..511
@@ -94,8 +104,22 @@
 #define GP_DPAD_RIGHT    0x04
 #define GP_DPAD_LEFT     0x08
 
-extern float tft_move_step_mm (void);
-extern float tft_move_step_next (void);
+// Jog step for the D-pad, cycled with Share. A display plugin can share its own step by
+// providing these two functions (tft_display.c does), the weak versions below are used otherwise.
+static const float gp_step_val[] = { 0.01f, 0.05f, 0.1f, 1.0f, 10.0f };
+static uint8_t gp_step = 3;     // index into gp_step_val[], default 1 mm
+
+__attribute__((weak)) float tft_move_step_mm (void)
+{
+    return gp_step_val[gp_step];
+}
+
+__attribute__((weak)) float tft_move_step_next (void)
+{
+    gp_step = (gp_step + 1) % (sizeof(gp_step_val) / sizeof(gp_step_val[0]));
+
+    return gp_step_val[gp_step];
+}
 
 #define GP_INVERT_X         1       // 1: reverse the jog direction of an axis
 #define GP_INVERT_Y         1
