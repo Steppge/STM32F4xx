@@ -1,7 +1,7 @@
 /*
   gamepad_plugin.c - jogging with a Bluetooth gamepad for grblHAL (STM32F4xx, BTT Octopus Pro)
 
-  PROTOTYPE v0.3 - jogging, jog enable on Options, buttons, connection watchdog. Keep a hand on the power switch.
+  PROTOTYPE v0.4 - jogging, jog enable on Options, buttons, connection watchdog. Keep a hand on the power switch.
 
   An ESP32 (see esp32_gamepad/) connects a PS4 controller (DualShock 4; DualSense and Xbox
   Series X|S work the same way) and sends its state every 20 ms over UART to the TFT header
@@ -9,9 +9,9 @@
 
     $GP,<seq>,<conn>,<lx>,<ly>,<rx>,<ry>,<l2>,<r2>,<buttons>,<dpad>,<misc>,<battery>*<hh>
 
-  and gets the jog enable state back (light bar red = enabled, blue = locked):
+  and gets the machine state back for the light bar and rumble (see esp32_gamepad/sketch.cpp):
 
-    $ST,<state>,<event>,<enabled>*<hh>
+    $ST,<state>,<event>,<enabled>*<hh>     event: 1 alarm, 2 job finished, 3 acknowledge
 
   Jogging works like the analog joystick plugin (joystick_plugin.c): JOY_STEPS speed steps per
   direction with hysteresis, step 1 has a fixed slow speed, segments are streamed as $J= jogs.
@@ -59,7 +59,7 @@
 #include "grbl/settings.h"
 #include "grbl/stream.h"
 
-#define GP_VERSION "0.3"
+#define GP_VERSION "0.4"
 
 // ------------------------------------------------------------------------
 // Configuration
@@ -78,6 +78,7 @@
 
 #define GP_HOLD_MS        600       // press time for "hold" buttons
 #define GP_STEP_RATE_PCT  30.0f     // D-pad step jog feed in % of the axis max rate
+#define GP_JOB_MIN_MS    10000      // "job finished" rumble only after jobs running at least this long
 
 // Bluepad32 button bits (PS4 names)
 #define GP_BTN_CROSS     0x0001     // BUTTON_A
@@ -622,8 +623,28 @@ static void gp_realtime (sys_state_t state)
     if(connected)
         poll_buttons(state, now);
 
+    // Events for the controller: alarm (long rumble), job finished (two pulses)
+    static sys_state_t last_state = STATE_IDLE;
+    static bool job_active = false;
+    static uint32_t job_start = 0;
+    uint8_t event = 0;
+
+    if((state & (STATE_ALARM|STATE_ESTOP)) && !(last_state & (STATE_ALARM|STATE_ESTOP))) {
+        event = 1;
+        job_active = false;
+    }
+    if((state & STATE_CYCLE) && !job_active) {
+        job_active = true;
+        job_start = now;
+    } else if(job_active && state == STATE_IDLE) {
+        job_active = false;
+        if(now - job_start >= GP_JOB_MIN_MS)
+            event = 2;
+    }
+    last_state = state;
+
     if(alive)
-        send_state(state, 0);
+        send_state(state, event);
 
     // Only act when idle or while a jog is running.
     if(state != STATE_IDLE && !(state & STATE_JOG)) {

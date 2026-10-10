@@ -27,7 +27,13 @@
       $ST,<state>,<event>,<enabled>*<hh>
         state    0 idle, 1 run, 2 hold, 3 alarm, 4 jog, 5 homing, 6 other
         event    0 none, 1 alarm/limit, 2 job finished, 3 short click (acknowledge)
-        enabled  jog enable: 1 = light bar red, 0 = light bar blue
+        enabled  jog enable 1/0
+
+  Light bar
+    idle locked blue, idle or jog with jog enable red, job green, hold orange, homing violet,
+    alarm red blinking. Controller battery below 20 %: short yellow flash every 10 s.
+  Rumble
+    short click on acknowledges, long strong on an alarm, two medium pulses when a job is finished.
 */
 
 #include "sdkconfig.h"
@@ -46,6 +52,11 @@
 #define CLEAR_HOLD_MS   10000
 #define PAIR_WINDOW_MS  60000
 #define MAX_ALLOWED     8
+#define LIGHT_INTERVAL  100     // ms, light bar update
+#define BLINK_MS        400     // alarm blink half period
+#define BATTERY_LOW     51      // Bluepad32 battery 0..255, 51 = 20 %, 0 = unknown
+#define BATTERY_FLASH_EVERY 10000
+#define BATTERY_FLASH_MS    300
 
 static ControllerPtr pad = nullptr;
 static Preferences prefs;
@@ -55,10 +66,10 @@ static uint8_t n_allowed = 0;
 static bool pairing = false;
 static uint32_t pairing_until = 0;
 
-static int machine_state = 0;
-static int jog_enabled = -1;        // -1 = unknown until the first message from the Octopus
-
-static void show_enabled (void);
+static int machine_state = 0;      // 0 idle, 1 run, 2 hold, 3 alarm, 4 jog, 5 homing, 6 other
+static int jog_enabled = 0;
+static uint32_t light_shown = 0xFFFFFFFF;   // last color sent, forces an update when changed
+static uint32_t second_pulse_at = 0;        // job finished: time of the second rumble pulse, 0 = none
 
 // ------------------------------------------------------------------------
 // Allow list (stored in NVS)
@@ -120,7 +131,7 @@ static void on_connected (ControllerPtr ctl)
     pad = ctl;
     pairing = false;
     Console.printf("Controller connected: %s\n", ctl->getModelName().c_str());
-    show_enabled();
+    light_shown = 0xFFFFFFFF;   // set the light bar on the next update
     ctl->playDualRumble(0, 150, 0x60, 0x60);
 }
 
@@ -159,44 +170,73 @@ static void send_state (void)
     Serial2.printf("$%s*%02X\n", body, checksum(body));
 }
 
-// Light bar: red while jogging is enabled, blue while locked (DualShock 4 / DualSense)
-static void show_enabled (void)
+#define RGB(r, g, b) (((uint32_t)(r) << 16) | ((uint32_t)(g) << 8) | (uint32_t)(b))
+
+// Light bar color for the machine state (DualShock 4 / DualSense)
+static uint32_t state_color (uint32_t now)
 {
-    if(pad)
-        pad->setColorLED(jog_enabled == 1 ? 100 : 0, 0, jog_enabled == 1 ? 0 : 60);
+    switch(machine_state) {
+        case 0:  return jog_enabled ? RGB(100, 0, 0) : RGB(0, 0, 60);  // idle: red enabled, blue locked
+        case 1:  return RGB(0, 70, 0);                                 // job: green
+        case 2:  return RGB(100, 40, 0);                               // hold: orange
+        case 3:  return (now / BLINK_MS) & 1 ? RGB(100, 0, 0) : 0;      // alarm: red blinking
+        case 4:  return RGB(100, 0, 0);                                // jog: red (enabled)
+        case 5:  return RGB(50, 0, 60);                                // homing: violet
+        default: return RGB(30, 30, 30);                               // other: white
+    }
 }
 
-// Light bar color per machine state (DualShock 4 / DualSense), not used yet
-__attribute__((unused)) static void show_state (int state)
+static void update_light (uint32_t now)
 {
-    static const uint8_t color[][3] = {
-        {   0, 60,   0 },   // idle: green
-        {   0,  0, 80 },    // run: blue
-        {  90, 40,   0 },   // hold: orange
-        { 100,  0,   0 },   // alarm: red
-        {   0, 40, 60 },    // jog: cyan
-        {  50,  0, 60 },    // homing: violet
-        {  30, 30, 30 }     // other: white
-    };
+    static uint32_t last = 0;
 
-    if(pad && state >= 0 && state < 7)
-        pad->setColorLED(color[state][0], color[state][1], color[state][2]);
+    if(!pad || now - last < LIGHT_INTERVAL)
+        return;
+
+    last = now;
+
+    uint32_t color = state_color(now);
+    uint8_t bat = pad->battery();
+
+    if(bat && bat < BATTERY_LOW && now % BATTERY_FLASH_EVERY < BATTERY_FLASH_MS)
+        color = RGB(100, 80, 0);    // low battery: yellow flash
+
+    if(color != light_shown) {
+        light_shown = color;
+        pad->setColorLED(color >> 16, (color >> 8) & 0xFF, color & 0xFF);
+    }
 }
 
-static void show_event (int event)
+static void show_event (int event, uint32_t now)
 {
     if(!pad)
         return;
 
     switch(event) {
-        case 1: pad->playDualRumble(0, 600, 0xFF, 0xFF); break;    // alarm / limit
-        case 2: pad->playDualRumble(0, 300, 0x80, 0x40); break;    // job finished
-        case 3: pad->playDualRumble(0, 60, 0x50, 0x00); break;     // click
+        case 1:     // alarm / limit: long and strong
+            pad->playDualRumble(0, 700, 0xFF, 0xFF);
+            break;
+        case 2:     // job finished: two medium pulses
+            pad->playDualRumble(0, 250, 0x90, 0x60);
+            second_pulse_at = now + 450;
+            break;
+        case 3:     // acknowledge: short click
+            pad->playDualRumble(0, 60, 0x50, 0x00);
+            break;
     }
 }
 
-// Parse "$ST,<state>,<event>*hh" lines from the Octopus
-static void receive (void)
+static void update_rumble (uint32_t now)
+{
+    if(second_pulse_at && (int32_t)(now - second_pulse_at) >= 0) {
+        second_pulse_at = 0;
+        if(pad)
+            pad->playDualRumble(0, 250, 0x90, 0x60);
+    }
+}
+
+// Parse "$ST,<state>,<event>,<enabled>*hh" lines from the Octopus
+static void receive (uint32_t now)
 {
     static char line[48];
     static uint8_t len = 0;
@@ -213,11 +253,8 @@ static void receive (void)
                 *star = '\0';
                 if(strtoul(star + 1, NULL, 16) == checksum(line) && sscanf(line, "ST,%d,%d,%d", &state, &event, &enabled) == 3) {
                     machine_state = state;
-                    if(enabled != jog_enabled) {
-                        jog_enabled = enabled;
-                        show_enabled();
-                    }
-                    show_event(event);
+                    jog_enabled = enabled;
+                    show_event(event, now);
                 }
             }
             len = 0;
@@ -285,8 +322,10 @@ void loop (void)
     uint32_t now = millis();
 
     BP32.update();
-    receive();
+    receive(now);
     poll_boot_button(now);
+    update_light(now);
+    update_rumble(now);
 
     if(now - last_send >= SEND_INTERVAL) {
         last_send = now;
