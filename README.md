@@ -33,7 +33,10 @@ Selected in [`Inc/my_machine.h`](Inc/my_machine.h), enable only one:
 #define GAMEPAD_ENABLE          1 // PS4/PS5/Xbox controller via ESP32 on the TFT header
 ```
 
-### Bluetooth gamepad jogging – [`Src/gamepad_plugin.c`](Src/gamepad_plugin.c) + [`esp32_gamepad/`](esp32_gamepad/)
+### Bluetooth gamepad jogging – plugin [Steppge/grblHAL-Plugin-Gamepad](https://github.com/Steppge/grblHAL-Plugin-Gamepad)
+Included as submodule in [`gamepad/`](gamepad/) and added to `lib_deps` of the `octopus_pro_f446` environment.
+The plugin is maintained in its own repository so other grblHAL users can use it too.
+
 A PS4 controller (DualShock 4; DualSense and Xbox Series X|S work as well) is connected with Bluetooth to an
 ESP32-WROOM-32 running [Bluepad32](https://github.com/ricardoquesada/bluepad32). The ESP32 sends the controller
 state every 20 ms over UART to the TFT header of the Octopus (USART1) and shows the machine state on the light bar.
@@ -87,9 +90,9 @@ two pulses when a job running at least 10 s has finished.
 - `$I` shows the connection (`Gamepad v0.4 (connected, jog locked)`), the status report the received values
   (`|Pad:connected,enabled,rx,ly,l2,r2`).
 
-Building the ESP32 firmware: see [`esp32_gamepad/README.md`](esp32_gamepad/README.md).
+Building the ESP32 firmware: see [`gamepad/esp32/README.md`](https://github.com/Steppge/grblHAL-Plugin-Gamepad/blob/main/esp32/README.md).
 
-### Analog joystick jogging (alternative) – [`Src/joystick_plugin.c`](Src/joystick_plugin.c)
+### Analog joystick jogging (alternative) – `joystick_plugin.c` in the gamepad plugin
 Disabled by default (`JOYSTICK_ANALOG_ENABLE 0`), kept for the analog sticks of an old RC transmitter.
 - Three analog sticks on TH1/TH2/TH3 (PF5/PF6/PF7) for X/Y/Z, enable switch on Stop7 (PG15).
 - While the enable switch is active, stick deflection streams short `$J=` jog segments; releasing the stick cancels the jog.

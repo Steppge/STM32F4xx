@@ -52,3 +52,6 @@
 [submodule "openpnp"]
 	path = openpnp
 	url = https://github.com/grblHAL/Plugin_OpenPNP/
+[submodule "gamepad"]
+	path = gamepad
+	url = https://github.com/Steppge/grblHAL-Plugin-Gamepad
