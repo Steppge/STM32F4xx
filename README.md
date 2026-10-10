@@ -26,7 +26,71 @@ The working branch is **`octopus-pro-joy`** (default branch). `master` tracks up
 ### Startup fix in `Src/main.c`
 The BTT bootloader leaves the system clock running from the PLL. Upstream only switched back to HSI before the PLL setup for `BOARD_BTT_OCTOPUS_PRO`, so any other board define (e.g. `BOARD_MY_MACHINE`) hung at startup without USB. The switch now depends on the actual clock source instead of the board define. Submitted upstream as [grblHAL/STM32F4xx#307](https://github.com/grblHAL/STM32F4xx/pull/307).
 
-### Analog joystick jogging – [`Src/joystick_plugin.c`](Src/joystick_plugin.c)
+### Jogging device
+Selected in [`Inc/my_machine.h`](Inc/my_machine.h), enable only one:
+```c
+#define JOYSTICK_ANALOG_ENABLE  0 // analog joystick on TH1-TH3, enable switch on Stop7
+#define GAMEPAD_ENABLE          1 // PS4/PS5/Xbox controller via ESP32 on the TFT header
+```
+
+### Bluetooth gamepad jogging – [`Src/gamepad_plugin.c`](Src/gamepad_plugin.c) + [`esp32_gamepad/`](esp32_gamepad/)
+A PS4 controller (DualShock 4; DualSense and Xbox Series X|S work as well) is connected with Bluetooth to an
+ESP32-WROOM-32 running [Bluepad32](https://github.com/ricardoquesada/bluepad32). The ESP32 sends the controller
+state every 20 ms over UART to the TFT header of the Octopus (USART1) and shows the machine state on the light bar.
+All machine logic is in the grblHAL plugin.
+
+**Wiring** (Octopus TFT header → ESP32 DevKit): 5V → VIN, GND → GND, TX → D16 (GPIO16), RX ← D17 (GPIO17).
+RST is not connected. While the ESP32 is on the PC USB, leave the 5V wire open.
+
+**Controls**
+
+| Control | Function |
+|---|---|
+| Left stick up/down | Y (10 speed steps) |
+| Right stick left/right | X (10 speed steps) |
+| L2 / R2 (analog) | Z up / Z down (both pressed: Z stops) |
+| Options | Jog enable on/off (light bar red / blue) |
+| Circle | Tap: feed hold. After the hold: hold = STOP (abort the job) |
+| Cross | Tap: resume (cycle start) |
+| Triangle | Hold: home |
+| Square | Hold: X0 Y0 |
+| R1 | Hold: Z0 |
+| PS | Tap: reset after a hard limit alarm, else unlock |
+| Share | Tap: next jog step 0.01 / 0.05 / 0.1 / 1 / 10 mm (shared with the display Move screen) |
+| D-pad, idle | One jog step X-/X+/Y-/Y+ per press (needs jog enable) |
+| D-pad, job | Up/down: feed override ±10 %, right/left: power override ±10 % |
+
+Every axis has its own control, so a slightly diagonal stick never moves a second axis. "Hold" = 0.6 s.
+
+**Light bar and rumble**
+
+| State | Light bar |
+|---|---|
+| Idle, jog locked | blue |
+| Idle or jog, jog enabled | red |
+| Job running | green |
+| Hold | orange |
+| Homing | violet |
+| Alarm | red blinking |
+| Controller battery below 20 % | short yellow flash every 10 s |
+
+Rumble: short click on acknowledges (jog enable, step change, home, zeroing, stop), long on an alarm,
+two pulses when a job running at least 10 s has finished.
+
+**Safety**
+- Jogging needs the jog enable (Options). It switches off by itself after 60 s without motion, when the controller
+  disconnects, on an alarm, when a job starts and at power-up, and can only be switched on while the machine is
+  idle and all sticks and triggers are at rest.
+- Releasing a stick or trigger stops the axis. No valid packet for 200 ms (cable, ESP32) stops everything.
+- The ESP32 accepts only controllers on its allow list (pairing: hold BOOT 3 s, then put the controller in
+  pairing mode; PS4: Share + PS). Packets carry a checksum.
+- `$I` shows the connection (`Gamepad v0.4 (connected, jog locked)`), the status report the received values
+  (`|Pad:connected,enabled,rx,ly,l2,r2`).
+
+Building the ESP32 firmware: see [`esp32_gamepad/README.md`](esp32_gamepad/README.md).
+
+### Analog joystick jogging (alternative) – [`Src/joystick_plugin.c`](Src/joystick_plugin.c)
+Disabled by default (`JOYSTICK_ANALOG_ENABLE 0`), kept for the analog sticks of an old RC transmitter.
 - Three analog sticks on TH1/TH2/TH3 (PF5/PF6/PF7) for X/Y/Z, enable switch on Stop7 (PG15).
 - While the enable switch is active, stick deflection streams short `$J=` jog segments; releasing the stick cancels the jog.
 - 10 speed steps per direction with hysteresis and smoothed readings. Step 1 has a fixed slow speed (5 mm/min X/Y, 2 mm/min Z) for touching off, steps 2-10 rise up to 35 % of the axis max rate (`$110`-`$112`).
@@ -90,7 +154,7 @@ Overrides other than 100 % are shown at the end of the info line, e.g. `logo.nc 
    - `#define BOARD_MY_MACHINE` – pin map [`boards/my_machine_map.h`](boards/my_machine_map.h) (this machine's wiring, active by default)
    - `#define BOARD_BTT_OCTOPUS_PRO` – original grblHAL pin map for the Octopus Pro (v1.1)
 
-   Also check the other options in `my_machine.h` (motor currents, ganged Y axis, laser, ...). If you don't have the joystick, display and controller fan, remove `-D ADD_MY_PLUGIN=1` from the `octopus_pro_f446` environment in `platformio.ini`.
+   Also check the other options in `my_machine.h` (motor currents, ganged Y axis, laser, ...). If you don't have the gamepad/joystick, display and controller fan, remove `-D ADD_MY_PLUGIN=1` from the `octopus_pro_f446` environment in `platformio.ini`.
 4. Build the environment **`octopus_pro_f446`** (linker script `STM32F446ZETX_BL32K_NONVS_FLASH.ld`, 32K bootloader offset).
 5. Copy `.pio/build/octopus_pro_f446/firmware.bin` as `firmware.bin` to the SD card and power up the board.
    Or over USB (machine idle, no sender connected, needs `SDCARD_ENABLE 2` and pyserial): `python tools/upload_firmware.py --reboot` uploads the file to the SD card in the board with YModem and reboots, the bootloader then flashes it.
