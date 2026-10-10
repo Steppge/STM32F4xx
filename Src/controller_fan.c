@@ -42,20 +42,27 @@ static void fan_stepper_enable (axes_signals_t enable, bool hold)
     fan_set(enable.mask != 0);
 }
 
+// Called for every digital output, remembers the port number of the fan pin.
+static bool find_fan_port (xbar_t *pin, uint8_t port, void *data)
+{
+    if((GPIO_TypeDef *)pin->port == CTRL_FAN_PORT && pin->pin == CTRL_FAN_PIN) {
+        *(uint8_t *)data = port;
+        return true;
+    }
+
+    return false;
+}
+
 void controller_fan_init (void)
 {
-    // Find the aux output port that is mapped to PD12 and claim it.
-    uint8_t n_ports = ioports_available(Port_Digital, Port_Output);
+    uint8_t port = IOPORT_UNASSIGNED;
 
-    for(uint8_t port = 0; port < n_ports; port++) {
-
-        xbar_t *info = ioport_get_info(Port_Digital, Port_Output, port);
-
-        if(info && (GPIO_TypeDef *)info->port == CTRL_FAN_PORT && info->pin == CTRL_FAN_PIN) {
-            uint8_t p = port;
-            fan_ok = ioport_claim(Port_Digital, Port_Output, &p, "Controller fan") != NULL;
-            break;
-        }
+    // Find the output port number of the fan pin and claim exactly that port.
+    // ioport_get_info() counts in driver order, ioport_claim() expects the port number (P0, P1..),
+    // ioports_enumerate() delivers the port number for each pin.
+    if(ioports_enumerate(Port_Digital, Port_Output, (pin_cap_t){0}, find_fan_port, &port)) {
+        xbar_t *pin = ioport_claim(Port_Digital, Port_Output, &port, "Controller fan");
+        fan_ok = pin && (GPIO_TypeDef *)pin->port == CTRL_FAN_PORT && pin->pin == CTRL_FAN_PIN;
     }
 
     if(fan_ok) {
